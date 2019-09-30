@@ -478,6 +478,7 @@ def parse_cpu_trace(thread_records):
                 thread=start.thread_id(),
                 cpu_start=start_record.cpu_elapsed_us(start),
                 cpu_end=start_record.cpu_elapsed_us(record))
+            '''
             if start.has_cuda():
                 cuda_start = adjusted_time(start)
                 cuda_end = adjusted_time(record)
@@ -485,6 +486,7 @@ def parse_cpu_trace(thread_records):
                                  start.device(),
                                  cuda_start,
                                  cuda_end)
+            '''
             functions.append(fe)
 
     functions.sort(key=lambda evt: evt.cpu_interval.start)
