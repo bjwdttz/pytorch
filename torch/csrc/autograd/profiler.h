@@ -93,7 +93,7 @@ struct Event final {
     return thread_id_;
   }
   int64_t cpu_elapsed_us(const Event & e) {
-    return e.cpu_ns_ / 1000;
+    return e.cpu_ns_;
   }
   double cuda_elapsed_us(const Event & e) {
 #ifdef USE_CUDA
