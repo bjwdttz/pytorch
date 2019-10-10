@@ -221,3 +221,7 @@ TAGS
 # Files generated when a patch is rejected
 *.orig
 *.rej
+android/libs/fbjni/
+third_party/fbgemm
+third_party/onnx
+third_party/tbb/

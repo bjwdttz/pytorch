@@ -471,6 +471,9 @@ def parse_cpu_trace(thread_records):
             record_stack.append((next_id, record))
             next_id += 1
         elif record.kind() == 'pop':
+            if not record_stack:
+                print("empty record!")
+                continue
             function_id, start = record_stack.pop()
             fe = FunctionEvent(
                 id=function_id,
