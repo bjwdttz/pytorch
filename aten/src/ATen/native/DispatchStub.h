@@ -59,6 +59,10 @@ template <typename rT, typename T, typename... Args>
 struct CAFFE2_API DispatchStub<rT (*)(Args...), T> {
   using FnPtr = rT (*) (Args...);
 
+  DispatchStub() = default;
+  DispatchStub(const DispatchStub&) = delete;
+  DispatchStub& operator=(const DispatchStub&) = delete;
+
   template <typename... ArgTypes>
   rT operator()(DeviceType device_type, ArgTypes&&... args) {
     if (device_type == DeviceType::CPU) {
@@ -119,7 +123,8 @@ struct RegisterCUDADispatch {
 template <typename FnPtr, typename T>
 struct RegisterHIPDispatch {
   RegisterHIPDispatch(DispatchStub<FnPtr, T>& stub, FnPtr value) {
-    stub.hip_dispatch_ptr = value;
+    // TODO: make this point at hip_dispatch_ptr
+    stub.cuda_dispatch_ptr = value;
   }
 };
 } // anonymous namespace
@@ -130,7 +135,11 @@ struct RegisterHIPDispatch {
 // not work with MSVC. So do a `using`-declaration if you need to pass in such
 // `fn`, e.g., grid_sampler_2d_backward_cpu_kernel in GridSampleKernel.h.
 #define DECLARE_DISPATCH(fn, name)         \
-  struct name : DispatchStub<fn, name> {}; \
+  struct name : DispatchStub<fn, name> {   \
+    name() = default;                      \
+    name(const name&) = delete;            \
+    name& operator=(const name&) = delete; \
+  };                                       \
   extern CAFFE2_API struct name name
 
 #define DEFINE_DISPATCH(name) struct name name
@@ -166,7 +175,10 @@ struct RegisterHIPDispatch {
 #if defined(__CUDACC__)
 #define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
 #elif defined(__HIPCC__)
-#define REGISTER_DISPATCH(name, fn) REGISTER_HIP_DISPATCH(name, fn)
+// TODO: cut this over to HIP dispatch once we stop pretending that CUDA
+// is HIP in the PyTorch HIPify build.
+#define REGISTER_DISPATCH(name, fn) REGISTER_CUDA_DISPATCH(name, fn)
+// #define REGISTER_DISPATCH(name, fn) REGISTER_HIP_DISPATCH(name, fn)
 #elif defined(CPU_CAPABILITY)
 #define REGISTER_DISPATCH(name, fn) REGISTER_ARCH_DISPATCH(name, CPU_CAPABILITY, fn)
 #endif

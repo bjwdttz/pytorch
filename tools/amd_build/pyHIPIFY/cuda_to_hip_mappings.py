@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import collections
 
 from pyHIPIFY.constants import *
@@ -107,6 +108,7 @@ CUDA_TYPE_NAME_MAP = collections.OrderedDict([
     ("CUstreamBatchMemOpType", ("hipStreamBatchMemOpType", CONV_TYPE, API_DRIVER, HIP_UNSUPPORTED)),
     ("CUdevice_P2PAttribute", ("hipDeviceP2PAttribute", CONV_TYPE, API_DRIVER, HIP_UNSUPPORTED)),
     ("CUevent", ("hipEvent_t", CONV_TYPE, API_DRIVER)),
+    ("CUevent_st", ("ihipEvent_t", CONV_TYPE, API_DRIVER)),
     ("CUevent_flags", ("hipEventFlags", CONV_EVENT, API_DRIVER, HIP_UNSUPPORTED)),
     ("CUfilter_mode", ("hipTextureFilterMode", CONV_TEX, API_DRIVER)),
     ("CUGLDeviceList", ("hipGLDeviceList", CONV_GL, API_DRIVER, HIP_UNSUPPORTED)),
@@ -276,7 +278,14 @@ CUDA_INCLUDE_MAP = collections.OrderedDict([
     ("cusparse.h", ("hipsparse.h", CONV_INCLUDE, API_RAND)),
     ("cufft.h", ("hipfft.h", CONV_INCLUDE, API_BLAS)),
     ("cufftXt.h", ("hipfft.h", CONV_INCLUDE, API_BLAS)),
-    ("#include <nvfunctional>", ("", CONV_INCLUDE, API_RAND, HIP_UNSUPPORTED)),
+    ("nvrtc.h", ("hip/hiprtc.h", CONV_INCLUDE, API_RTC)),
+    ("thrust/system/cuda/", ("thrust/system/hip/", CONV_INCLUDE, API_BLAS)),
+    ("cub/util_allocator.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
+    ("cub/block/block_reduce.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
+    ("cub/cub.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
+    ("cub/block/block_load.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
+    ("cub/device/device_reduce.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
+    ("cub/device/device_scan.cuh", ("hipcub/hipcub.hpp", CONV_INCLUDE, API_BLAS)),
 ])
 
 CUDA_IDENTIFIER_MAP = collections.OrderedDict([
@@ -1729,7 +1738,7 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict([
     ("cublasCgemmStridedBatched", ("rocblas_cgemm_strided_batched", CONV_MATH_FUNC, API_BLAS, HIP_UNSUPPORTED)),
     ("cublasCgemm3mStridedBatched", ("rocblas_cgemm_3m_strided_batched", CONV_MATH_FUNC, API_BLAS, HIP_UNSUPPORTED)),
     ("cublasZgemmStridedBatched", ("rocblas_zgemm_strided_batched", CONV_MATH_FUNC, API_BLAS, HIP_UNSUPPORTED)),
-    ("cublasHgemmStridedBatched", ("rocblas_hgemm_batched", CONV_MATH_FUNC, API_BLAS, HIP_UNSUPPORTED)),
+    ("cublasHgemmStridedBatched", ("rocblas_hgemm_strided_batched", CONV_MATH_FUNC, API_BLAS, HIP_UNSUPPORTED)),
     ("cublasSgemm", ("rocblas_sgemm", CONV_MATH_FUNC, API_BLAS)),
     ("cublasDgemm", ("rocblas_dgemm", CONV_MATH_FUNC, API_BLAS)),
     ("cublasCgemm", ("rocblas_cgemm", CONV_MATH_FUNC, API_BLAS)),
@@ -2074,6 +2083,7 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict([
     ("curandSetQuasiRandomGeneratorDimensions", ("hiprandSetQuasiRandomGeneratorDimensions", CONV_MATH_FUNC, API_RAND)),
     ("curandSetStream", ("hiprandSetStream", CONV_MATH_FUNC, API_RAND)),
     ("curand", ("hiprand", CONV_DEVICE_FUNC, API_RAND)),
+    ("curand4", ("hiprand4", CONV_DEVICE_FUNC, API_RAND)),
     ("curand_init", ("hiprand_init", CONV_DEVICE_FUNC, API_RAND)),
     ("curand_log_normal", ("hiprand_log_normal", CONV_DEVICE_FUNC, API_RAND)),
     ("curand_log_normal_double", ("hiprand_log_normal_double", CONV_DEVICE_FUNC, API_RAND)),
@@ -2173,19 +2183,47 @@ CUDA_IDENTIFIER_MAP = collections.OrderedDict([
     ("cufftDestroy", ("hipfftDestroy", CONV_MATH_FUNC, API_FFT)),
     ("cufftGetVersion", ("hipfftGetVersion", CONV_MATH_FUNC, API_FFT)),
     ("cufftGetProperty", ("hipfftGetProperty", CONV_MATH_FUNC, API_FFT, HIP_UNSUPPORTED)),
+    ("nvrtcResult", ("hiprtcResult", CONV_TYPE, API_RTC)),
+    ("NVRTC_SUCCESS", ("HIPRTC_SUCCESS", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_OUT_OF_MEMORY", ("HIPRTC_ERROR_OUT_OF_MEMORY", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_PROGRAM_CREATION_FAILURE", ("HIPRTC_ERROR_PROGRAM_CREATION_FAILURE", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_INVALID_INPUT", ("HIPRTC_ERROR_INVALID_INPUT", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_INVALID_PROGRAM", ("HIPRTC_ERROR_INVALID_PROGRAM", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_COMPILATION", ("HIPRTC_ERROR_COMPILATION", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_BUILTIN_OPERATION_FAILURE", ("HIPRTC_ERROR_BUILTIN_OPERATION_FAILURE", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_NO_NAME_EXPRESSIONS_AFTER_COMPILATION", ("HIPRTC_ERROR_NO_NAME_EXPRESSIONS_AFTER_COMPILATION", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_NAME_EXPRESSION_NOT_VALID", ("HIPRTC_ERROR_NAME_EXPRESSION_NOT_VALID", CONV_TYPE, API_RTC)),
+    ("NVRTC_ERROR_INTERNAL_ERROR", ("HIPRTC_ERROR_INTERNAL_ERROR", CONV_TYPE, API_RTC)),
+    ("nvrtcGetErrorString", ("hiprtcGetErrorString", CONV_JIT, API_RTC)),
+    ("nvrtcVersion", ("hiprtcVersion", CONV_JIT, API_RTC)),
+    ("nvrtcProgram", ("hiprtcProgram", CONV_TYPE, API_RTC)),
+    ("nvrtcAddNameExpression", ("hiprtcAddNameExpression", CONV_JIT, API_RTC)),
+    ("nvrtcCompileProgram", ("hiprtcCompileProgram", CONV_JIT, API_RTC)),
+    ("nvrtcCreateProgram", ("hiprtcCreateProgram", CONV_JIT, API_RTC)),
+    ("nvrtcDestroyProgram", ("hiprtcDestroyProgram", CONV_JIT, API_RTC)),
+    ("nvrtcGetLoweredName", ("hiprtcGetLoweredName", CONV_JIT, API_RTC)),
+    ("nvrtcGetProgramLog", ("hiprtcGetProgramLog", CONV_JIT, API_RTC)),
+    ("nvrtcGetProgramLogSize", ("hiprtcGetProgramLogSize", CONV_JIT, API_RTC)),
+    ("nvrtcGetPTX", ("hiprtcGetCode", CONV_JIT, API_RTC)),
+    ("nvrtcGetPTXSize", ("hiprtcGetCodeSize", CONV_JIT, API_RTC)),
+    ("thrust::cuda::", ("thrust::hip::", CONV_MATH_FUNC, API_BLAS)),
+    ("cub::", ("hipcub::", CONV_MATH_FUNC, API_BLAS)),
 ])
 
 CUDA_SPARSE_MAP = collections.OrderedDict([
     ("cusparseStatus_t", ("hipsparseStatus_t", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseHandle_t", ("hipsparseHandle_t", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseOperation_t", ("hipsparseOperation_t", CONV_TYPE, API_SPARSE)),
+    ("cusparseCreateMatDescr", ("hipsparseCreateMatDescr", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseCreate", ("hipsparseCreate", CONV_MATH_FUNC, API_SPARSE)),
+    ("cusparseDestroyMatDescr", ("hipsparseDestroyMatDescr", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseDestroy", ("hipsparseDestroy", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseXcoo2csr", ("hipsparseXcoo2csr", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseMatDescr_t", ("hipsparseMatDescr_t", CONV_MATH_FUNC, API_SPARSE)),
-    ("cusparseCreateMatDescr", ("hipsparseCreateMatDescr", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseScsrmm2", ("hipsparseScsrmm2", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseDcsrmm2", ("hipsparseDcsrmm2", CONV_MATH_FUNC, API_SPARSE)),
+    ("cusparseScsrmm", ("hipsparseScsrmm", CONV_MATH_FUNC, API_SPARSE)),
+    ("cusparseDcsrmm", ("hipsparseDcsrmm", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseXcsrsort_bufferSizeExt", ("hipsparseXcsrsort_bufferSizeExt", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseXcsrsort", ("hipsparseXcsrsort", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseXcoosort_bufferSizeExt", ("hipsparseXcoosort_bufferSizeExt", CONV_MATH_FUNC, API_SPARSE)),
@@ -2193,6 +2231,7 @@ CUDA_SPARSE_MAP = collections.OrderedDict([
     ("cusparseSetStream", ("hipsparseSetStream", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseCreateIdentityPermutation", ("hipsparseCreateIdentityPermutation", CONV_MATH_FUNC, API_SPARSE)),
     ("cusparseSetMatIndexBase", ("hipsparseSetMatIndexBase", CONV_MATH_FUNC, API_SPARSE)),
+    ("cusparseSetMatType", ("hipsparseSetMatType", CONV_MATH_FUNC, API_SPARSE)),
     ("CUSPARSE_STATUS_SUCCESS", ("HIPSPARSE_STATUS_SUCCESS", CONV_NUMERIC_LITERAL, API_SPARSE)),
     ("CUSPARSE_STATUS_NOT_INITIALIZED", ("HIPSPARSE_STATUS_NOT_INITIALIZED", CONV_NUMERIC_LITERAL, API_SPARSE)),
     ("CUSPARSE_STATUS_ALLOC_FAILED", ("HIPSPARSE_STATUS_ALLOC_FAILED", CONV_NUMERIC_LITERAL, API_SPARSE)),
@@ -2208,22 +2247,77 @@ CUDA_SPARSE_MAP = collections.OrderedDict([
     ("CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE", ("HIPSPARSE_OPERATION_CONJUGATE_TRANSPOSE", CONV_NUMERIC_LITERAL, API_SPARSE)),
     ("CUSPARSE_INDEX_BASE_ZERO", ("HIPSPARSE_INDEX_BASE_ZERO", CONV_NUMERIC_LITERAL, API_SPARSE)),
     ("CUSPARSE_INDEX_BASE_ONE", ("HIPSPARSE_INDEX_BASE_ONE", CONV_NUMERIC_LITERAL, API_SPARSE)),
+    ("CUSPARSE_MATRIX_TYPE_GENERAL", ("HIPSPARSE_MATRIX_TYPE_GENERAL", CONV_NUMERIC_LITERAL, API_SPARSE)),
 ])
 
 PYTORCH_SPECIFIC_MAPPINGS = collections.OrderedDict([
     ("cudaHostAllocator", ("hipHostAllocator", API_PYTORCH)),
     ("cudaDeviceAllocator", ("hipDeviceAllocator", API_PYTORCH)),
     ("define MAX_NUM_BLOCKS 200", ("define MAX_NUM_BLOCKS 64", API_PYTORCH)),
+
+    ("cuda::CUDAGuard", ("hip::HIPGuardMasqueradingAsCUDA", API_PYTORCH)),
+    ("CUDAGuard", ("HIPGuardMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::OptionalCUDAGuard", ("hip::OptionalHIPGuardMasqueradingAsCUDA", API_PYTORCH)),
+    ("OptionalCUDAGuard", ("OptionalHIPGuardMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::CUDAStreamGuard", ("hip::HIPStreamGuardMasqueradingAsCUDA", API_PYTORCH)),
+    ("CUDAStreamGuard", ("HIPStreamGuardMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::OptionalCUDAStreamGuard", ("hip::OptionalHIPStreamGuardMasqueradingAsCUDA", API_PYTORCH)),
+    ("OptionalCUDAStreamGuard", ("OptionalHIPStreamGuardMasqueradingAsCUDA", API_PYTORCH)),
+
+    # Only get needs to be transformed this way; all the other ones can go
+    # straight to the normal versions hip::HIPCachingAllocator
+    ("cuda::CUDACachingAllocator::get", ("hip::HIPCachingAllocatorMasqueradingAsCUDA::get", API_PYTORCH)),
+    ("CUDACachingAllocator::get", ("HIPCachingAllocatorMasqueradingAsCUDA::get", API_PYTORCH)),
+    ("cuda::CUDACachingAllocator::recordStream", ("hip::HIPCachingAllocatorMasqueradingAsCUDA::recordStreamMasqueradingAsCUDA", API_PYTORCH)),
+    ("CUDACachingAllocator::recordStream", ("HIPCachingAllocatorMasqueradingAsCUDA::recordStreamMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::CUDAStream", ("hip::HIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+    ("CUDAStream", ("HIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::getStreamFromPool", ("hip::getStreamFromPoolMasqueradingAsCUDA", API_PYTORCH)),
+    ("getStreamFromPool", ("getStreamFromPoolMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::getDefaultCUDAStream", ("hip::getDefaultHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+    ("getDefaultCUDAStream", ("getDefaultHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::getCurrentCUDAStream", ("hip::getCurrentHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+    ("getCurrentCUDAStream", ("getCurrentHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+
+    ("cuda::setCurrentCUDAStream", ("hip::setCurrentHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+    ("setCurrentCUDAStream", ("setCurrentHIPStreamMasqueradingAsCUDA", API_PYTORCH)),
+
+    # TODO: Undo this special-case; see the header for motivation behind this
+    # hack.  It's VERY important this is only applied to PyTorch HIPify.
+    ("c10/cuda/CUDAGuard.h", ("ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h", API_PYTORCH)),
+    ("c10/cuda/CUDACachingAllocator.h", ("ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h", API_PYTORCH)),
+    ("c10/cuda/CUDAStream.h", ("ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h", API_PYTORCH)),
+    ("gloo/cuda.h", ("gloo/hip.h", API_PYTORCH)),
+    ("gloo/cuda_allreduce_halving_doubling.h", ("gloo/hip_allreduce_halving_doubling.h", API_PYTORCH)),
+    ("gloo/cuda_allreduce_halving_doubling_pipelined.h", ("gloo/hip_allreduce_halving_doubling_pipelined.h", API_PYTORCH)),
+    ("gloo/cuda_allreduce_ring.h", ("gloo/hip_allreduce_ring.h", API_PYTORCH)),
+    ("gloo/cuda_broadcast_one_to_all.h", ("gloo/hip_broadcast_one_to_all.h", API_PYTORCH)),
+    ("gloo::CudaAllreduceHalvingDoublingPipelined", ("gloo::HipAllreduceHalvingDoublingPipelined", API_PYTORCH)),
+    ("gloo::CudaBroadcastOneToAll", ("gloo::HipBroadcastOneToAll", API_PYTORCH)),
+    ("gloo::CudaHostWorkspace", ("gloo::HipHostWorkspace", API_PYTORCH)),
+    ("gloo::CudaDeviceWorkspace", ("gloo::HipDeviceWorkspace", API_PYTORCH)),
 ])
 
 CAFFE2_SPECIFIC_MAPPINGS = collections.OrderedDict([
     ("cuda_stream" , ("hip_stream", API_CAFFE2)),
+    # if the header is a native hip folder (under hip directory),
+    # there is no need to add a hip path to it; the trie in hipify script
+    # takes this mapping order to forbid further replacement
+    ("/hip/" , ("/hip/", API_CAFFE2)),
     ("/context_gpu" , ("/hip/context_gpu", API_CAFFE2)),
     ("/common_gpu"  , ("/hip/common_gpu", API_CAFFE2)),
     ("/mixed_utils" , ("/hip/mixed_utils", API_CAFFE2)),
     ("/operator_fallback_gpu" , ("/hip/operator_fallback_gpu", API_CAFFE2)),
-    ("/spatial_batch_norm_op_gpu_impl" , ("/hip/spatial_batch_norm_op_gpu_impl", API_CAFFE2)),
+    ("/spatial_batch_norm_op_impl" , ("/hip/spatial_batch_norm_op_impl", API_CAFFE2)),
     ("/recurrent_network_executor_gpu" , ("/hip/recurrent_network_executor_gpu", API_CAFFE2)),
+    ("/generate_proposals_op_util_nms_gpu" , ("/hip/generate_proposals_op_util_nms_gpu", API_CAFFE2)),
     ("/max_pool_with_index_gpu", ("/hip/max_pool_with_index_gpu", API_CAFFE2)),
     ("/THCCachingAllocator_gpu", ("/hip/THCCachingAllocator_gpu", API_CAFFE2)),
     ("/top_k_heap_selection", ("/hip/top_k_heap_selection", API_CAFFE2)),
@@ -2231,6 +2325,7 @@ CAFFE2_SPECIFIC_MAPPINGS = collections.OrderedDict([
     ("/GpuDefs", ("/hip/GpuDefs", API_CAFFE2)),
     ("/GpuScanUtils", ("/hip/GpuScanUtils", API_CAFFE2)),
     ("/GpuBitonicSort", ("/hip/GpuBitonicSort", API_CAFFE2)),
+    ("/math/reduce.cuh", ("/math/hip/reduce.cuh", API_CAFFE2)),
     ("/gather_op.cuh", ("/hip/gather_op.cuh", API_CAFFE2)),
     ("caffe2/core/common_cudnn.h", ("caffe2/core/hip/common_miopen.h", API_CAFFE2)),
     ("REGISTER_CUDA_OPERATOR" , ("REGISTER_HIP_OPERATOR", API_CAFFE2)),
@@ -2250,10 +2345,17 @@ CAFFE2_SPECIFIC_MAPPINGS = collections.OrderedDict([
     ("CUDA" ,("HIP", API_CAFFE2)),
     ("Cuda" ,("Hip", API_CAFFE2)),
     ("cuda_" ,("hip_", API_CAFFE2)),
+    ("_cuda" ,("_hip", API_CAFFE2)),
     ("CUDNN" ,("MIOPEN", API_CAFFE2)),
     ("CuDNN" ,("MIOPEN", API_CAFFE2)),
     ("cudnn" ,("miopen", API_CAFFE2)),
     ("namespace cuda", ("namespace hip", API_CAFFE2)),
+    ("cuda::CUDAGuard", ("hip::HIPGuard", API_CAFFE2)),
+    ("cuda::OptionalCUDAGuard", ("hip::OptionalHIPGuard", API_CAFFE2)),
+    ("cuda::CUDAStreamGuard", ("hip::HIPStreamGuard", API_CAFFE2)),
+    ("cuda::OptionalCUDAStreamGuard", ("hip::OptionalHIPStreamGuard", API_CAFFE2)),
+    ("c10/cuda/CUDAGuard.h", ("c10/hip/HIPGuard.h", API_CAFFE2)),
+    ("gloo/cuda", ("gloo/hip", API_CAFFE2)),
 ])
 
 # We must tread very carefully here.  Blanket conversions like are done
@@ -2272,15 +2374,31 @@ C10_MAPPINGS = collections.OrderedDict([
     ("c10/cuda/CUDAMacros.h", ("c10/hip/HIPMacros.h", API_C10)),
     ("c10/cuda/CUDAMathCompat.h", ("c10/hip/HIPMathCompat.h", API_C10)),
     ("c10/cuda/CUDAFunctions.h", ("c10/hip/HIPFunctions.h", API_C10)),
+    ("c10/cuda/CUDAStream.h", ("c10/hip/HIPStream.h", API_C10)),
+    ("c10/cuda/CUDACachingAllocator.h", ("c10/hip/HIPCachingAllocator.h", API_C10)),
     ("c10/cuda/impl/CUDATest.h", ("c10/hip/impl/HIPTest.h", API_C10)),
+    ("c10/cuda/impl/CUDAGuardImpl.h", ("c10/hip/impl/HIPGuardImpl.h", API_C10)),
     ("c10/cuda/impl/cuda_cmake_macros.h", ("c10/hip/impl/hip_cmake_macros.h", API_C10)),
     ("C10_CUDA_CHECK", ("C10_HIP_CHECK", API_C10)),
+    ("C10_CUDA_CHECK_WARN", ("C10_HIP_CHECK_WARN", API_C10)),
     ("c10::cuda", ("c10::hip", API_C10)),
+    ("cuda::CUDAStream", ("hip::HIPStream", API_C10)),
+    ("CUDAStream", ("HIPStream", API_C10)),
     # This substitution is not permissible, because there's another copy of this
     # function in torch/cuda.h
     # ("cuda::device_count", ("hip::device_count", API_C10)),
     ("cuda::current_device", ("hip::current_device", API_C10)),
     ("cuda::set_device", ("hip::set_device", API_C10)),
+    ("cuda::getStreamFromPool", ("hip::getStreamFromPool", API_C10)),
+    ("getStreamFromPool", ("getStreamFromPool", API_C10)),
+    ("cuda::getDefaultCUDAStream", ("hip::getDefaultHIPStream", API_C10)),
+    ("getDefaultCUDAStream", ("getDefaultHIPStream", API_C10)),
+    ("cuda::getCurrentCUDAStream", ("hip::getCurrentHIPStream", API_C10)),
+    ("getCurrentCUDAStream", ("getCurrentHIPStream", API_C10)),
+    ("cuda::setCurrentCUDAStream", ("hip::setCurrentHIPStream", API_C10)),
+    ("setCurrentCUDAStream", ("setCurrentHIPStream", API_C10)),
+    ("cuda::CUDACachingAllocator", ("hip::HIPCachingAllocator", API_C10)),
+    ("CUDACachingAllocator", ("HIPCachingAllocator", API_C10)),
 ])
 
 # NB: C10 mappings are more specific than Caffe2 mappings, so run them

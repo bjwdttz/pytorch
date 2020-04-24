@@ -31,10 +31,7 @@ import re
 import shutil
 import sys
 import os
-import json
-import subprocess
 
-from enum import Enum
 from pyHIPIFY import constants
 from pyHIPIFY.cuda_to_hip_mappings import CUDA_TO_HIP_MAPPINGS
 from pyHIPIFY.cuda_to_hip_mappings import MATH_TRANSPILATIONS
@@ -76,142 +73,15 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 
-class disablefuncmode(Enum):
-    """ How to disable functions
-    REMOVE - Remove the function entirely (includes the signature).
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```
-            ```
-
-    STUB - Stub the function and return an empty object based off the type.
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ret_type obj;
-                return obj;
-            }```
-
-
-    HCC_MACRO - Add !defined(__HIP_PLATFORM_HCC__) preprocessors around the function.
-        This macro is defined by HIP if the compiler used is hcc.
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```#if !defined(__HIP_PLATFORM_HCC__)
-                    ret_type function(arg_type1 arg1, ..., ){
-                    ...
-                    ...
-                    ...
-                }
-               #endif
-            ```
-
-
-    DEVICE_MACRO - Add !defined(__HIP_DEVICE_COMPILE__) preprocessors around the function.
-        This macro is defined by HIP if either hcc or nvcc are used in the device path.
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```#if !defined(__HIP_DEVICE_COMPILE__)
-                    ret_type function(arg_type1 arg1, ..., ){
-                    ...
-                    ...
-                    ...
-                }
-               #endif
-            ```
-
-
-    EXCEPTION - Stub the function and throw an exception at runtime.
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                throw std::runtime_error("The function function is not implemented.")
-            }```
-
-
-    ASSERT - Stub the function and throw an assert(0).
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                assert(0);
-            }```
-
-
-    EMPTYBODY - Stub the function and keep an empty body.
-        e.g.
-        FROM:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ...
-                ...
-                ...
-            }```
-
-        TO:
-            ```ret_type function(arg_type1 arg1, ..., ){
-                ;
-            }```
-
-
-
-    """
-    REMOVE = 0
-    STUB = 1
-    HCC_MACRO = 2
-    DEVICE_MACRO = 3
-    EXCEPTION = 4
-    ASSERT = 5
-    EMPTYBODY = 6
-
-
 def matched_files_iter(root_path, includes=('*',), ignores=(), extensions=(), out_of_place_only=False):
     def _fnmatch(filepath, patterns):
         return any(fnmatch.fnmatch(filepath, pattern) for pattern in patterns)
 
     def match_extensions(filename):
         """Helper method to see if filename ends with certain extension"""
-        return os.path.splitext(filename)[1] in extensions
+        return any(filename.endswith(e) for e in extensions)
+
+    exact_matches = set(includes)
 
     # This is a very rough heuristic; really, we want to avoid scanning
     # any file which is not checked into source control, but this script
@@ -230,7 +100,13 @@ def matched_files_iter(root_path, includes=('*',), ignores=(), extensions=(), ou
                 dirs.remove("third_party")
         for filename in filenames:
             filepath = os.path.join(rel_dirpath, filename)
-            if _fnmatch(filepath, includes) and (not _fnmatch(filepath, ignores)) and match_extensions(filepath):
+            # We respect extensions, UNLESS you wrote the entire
+            # filename verbatim, in which case we always accept it
+            if (
+                _fnmatch(filepath, includes)
+                and (not _fnmatch(filepath, ignores))
+                and (match_extensions(filepath) or filepath in exact_matches)
+            ):
                 if not is_pytorch_file(filepath) and not is_caffe2_gpu_file(filepath):
                     continue
                 if out_of_place_only and not is_out_of_place(filepath):
@@ -242,7 +118,8 @@ def preprocess(
         output_directory,
         all_files,
         show_detailed=False,
-        show_progress=True):
+        show_progress=True,
+        hip_clang_launch=False):
     """
     Call preprocessor on selected files.
 
@@ -250,21 +127,16 @@ def preprocess(
         show_detailed - Show a detailed summary of the transpilation process.
     """
 
-    # Compute the total number of files to be traversed.
-    total_count = len(all_files)
-    finished_count = 0
-
     # Preprocessing statistics.
     stats = {"unsupported_calls": [], "kernel_launches": []}
 
     for filepath in all_files:
-        preprocessor(output_directory, filepath, stats)
+        result = preprocessor(output_directory, filepath, stats, hip_clang_launch)
         # Show what happened
         if show_progress:
             print(
                 filepath, "->",
-                get_hip_file_path(filepath))
-            finished_count += 1
+                get_hip_file_path(filepath), result)
 
     print(bcolors.OKGREEN + "Successfully preprocessed all matching files." + bcolors.ENDC, file=sys.stderr)
 
@@ -368,7 +240,7 @@ def processKernelLaunches(string, stats):
 
             # Handle Kernel Name
             if status != AT_TEMPLATE:
-                if string[i].isalnum() or string[i] in  {'(', ')', '_', ':', '#'}:
+                if string[i].isalnum() or string[i] in {'(', ')', '_', ':', '#'}:
                     if status != AT_KERNEL_NAME:
                         status = AT_KERNEL_NAME
                         pos["kernel_name"]["end"] = i
@@ -493,28 +365,6 @@ def find_parentheses_group(input_string, start):
 RE_ASSERT = re.compile(r"\bassert[ ]*\(")
 
 
-def disable_asserts(input_string):
-    """ Disables regular assert statements
-    e.g. "assert(....)" -> "/*assert(....)*/"
-    """
-    output_string = input_string
-    asserts = list(RE_ASSERT.finditer(input_string))
-    for assert_item in asserts:
-        p_start, p_end = find_parentheses_group(input_string, assert_item.end() - 1)
-        start = assert_item.start()
-        output_string = output_string.replace(input_string[start:p_end + 1], "")
-    return output_string
-
-
-def replace_forceinline(input_string):
-    """__forceinline__'d methods can cause 'symbol multiply defined' errors in HIP.
-    Adding 'static' to all such methods leads to compilation errors, so
-    replacing '__forceinline__' with 'inline' as a workaround
-    https://github.com/ROCm-Developer-Tools/HIP/blob/master/docs/markdown/hip_faq.md#what-if-hip-generates-error-of-symbol-multiply-defined-only-on-amd-machine
-    """
-    return input_string.replace("__forceinline__", "inline")
-
-
 def replace_math_functions(input_string):
     """ FIXME: Temporarily replace std:: invocations of math functions with non-std:: versions to prevent linker errors
         NOTE: This can lead to correctness issues when running tests, since the correct version of the math function (exp/expf) might not get called.
@@ -522,7 +372,7 @@ def replace_math_functions(input_string):
     """
     output_string = input_string
     for func in MATH_TRANSPILATIONS:
-      output_string = output_string.replace(r'{}('.format(func), '{}('.format(MATH_TRANSPILATIONS[func]))
+        output_string = output_string.replace(r'{}('.format(func), '{}('.format(MATH_TRANSPILATIONS[func]))
 
     return output_string
 
@@ -576,154 +426,13 @@ def replace_extern_shared(input_string):
     return output_string
 
 
-def disable_function(input_string, function, replace_style):
-    """ Finds and disables a function in a particular file.
-
-    If type(function) == List
-        function - The signature of the function to disable.
-            e.g. ["bool", "overlappingIndices", "(const Tensor& t)"]
-            disables function -> "bool overlappingIndices(const Tensor& t)"
-
-    If type(function) == String
-        function - Disables the function by name only.
-            e.g. "overlappingIndices"
-
-    replace_style - The style to use when stubbing functions.
-    """
-# void (*)(hcrngStateMtgp32 *, int, float *, double, double)
-    info = {
-        "function_start": -1,
-        "function_end": -1,
-        "bracket_count": 0
-    }
-
-    STARTED = 0
-    INSIDE_FUNCTION = 1
-    BRACKET_COMPLETE = 2
-
-    STATE = STARTED
-
-    if type(function) == list:
-        # Extract components from function signature.
-        func_info = {
-            "return_type": function[0].strip(),
-            "function_name": function[1].strip(),
-            "function_args": function[2].strip()
-        }
-
-        # Create function string to search for
-        function_string = "{0}{1}{2}".format(
-            func_info["return_type"],
-            func_info["function_name"],
-            func_info["function_args"]
-        )
-
-        # Find the starting position for the function
-        info["function_start"] = input_string.find(function_string)
-    else:
-        # Automatically detect signature.
-        the_match = re.search(r"(((.*) (\*)?)({0})(\([^{{)]*\)))\s*{{".format(
-            function.replace("(", "\(").replace(")", "\)")), input_string)
-        if the_match is None:
-            return input_string
-
-        func_info = {
-            "return_type": the_match.group(2).strip(),
-            "function_name": the_match.group(5).strip(),
-            "function_args": the_match.group(6).strip(),
-        }
-
-        # Find the starting position for the function
-        info["function_start"] = the_match.start()
-        function_string = the_match.group(1)
-
-    # The function can't be found anymore.
-    if info["function_start"] == -1:
-        return input_string
-
-    # Find function block start.
-    pos = info["function_start"] + len(function_string) - 1
-    while pos < len(input_string) and STATE != BRACKET_COMPLETE:
-        if input_string[pos] == "{":
-            if STATE != INSIDE_FUNCTION:
-                STATE = INSIDE_FUNCTION
-                info["bracket_count"] = 1
-            else:
-                info["bracket_count"] += 1
-        elif input_string[pos] == "}":
-            info["bracket_count"] -= 1
-
-            if info["bracket_count"] == 0 and STATE == INSIDE_FUNCTION:
-                STATE = BRACKET_COMPLETE
-                info["function_end"] = pos
-
-        pos += 1
-
-    # Never found the function end. Corrupted file!
-    if STATE != BRACKET_COMPLETE:
-        return input_string
-
-    # Preprocess the source by removing the function.
-    function_body = input_string[info["function_start"]:info["function_end"] + 1]
-
-    # Remove the entire function body
-    if replace_style == disablefuncmode.REMOVE:
-        output_string = input_string.replace(function_body, "")
-
-    # Stub the function based off its return type.
-    elif replace_style == disablefuncmode.STUB:
-        # void return type
-        if func_info["return_type"] == "void" or func_info["return_type"] == "static void":
-            stub = "{0}{{\n}}".format(function_string)
-        # pointer return type
-        elif "*" in func_info["return_type"]:
-            stub = "{0}{{\nreturn {1};\n}}".format(function_string, "NULL")  # nullptr
-        else:
-            stub = "{0}{{\n{1} stub_var;\nreturn stub_var;\n}}".format(function_string, func_info["return_type"])
-
-        output_string = input_string.replace(function_body, stub)
-
-    # Add HIP Preprocessors.
-    elif replace_style == disablefuncmode.HCC_MACRO:
-        output_string = input_string.replace(
-            function_body,
-            "#if !defined(__HIP_PLATFORM_HCC__)\n{0}\n#endif".format(function_body))
-
-    # Add HIP Preprocessors.
-    elif replace_style == disablefuncmode.DEVICE_MACRO:
-        output_string = input_string.replace(
-            function_body,
-            "#if !defined(__HIP_DEVICE_COMPILE__)\n{0}\n#endif".format(function_body))
-
-    # Throw an exception at runtime.
-    elif replace_style == disablefuncmode.EXCEPTION:
-        stub = "{0}{{\n{1};\n}}".format(
-            function_string,
-            'throw std::runtime_error("The function {0} is not implemented.")'.format(
-                function_string.replace("\n", " ")))
-        output_string = input_string.replace(function_body, stub)
-
-    elif replace_style == disablefuncmode.ASSERT:
-        stub = "{0}{{\n{1};\n}}".format(
-            function_string,
-            'assert(0)')
-        output_string = input_string.replace(function_body, stub)
-
-    elif replace_style == disablefuncmode.EMPTYBODY:
-        stub = "{0}{{\n;\n}}".format(function_string)
-        output_string = input_string.replace(function_body, stub)
-    return output_string
-
-
 def get_hip_file_path(filepath):
     """
     Returns the new name of the hipified file
     """
-    # At the moment, PyTorch is HIPIFYed in-place.  We'd prefer for this
-    # to not be the case, but we can't conveniently do this until we
-    # also fix up PyTorch's build system to know how to handle things
-    # out-of-place.
-    if is_pytorch_file(filepath):
+    # At the moment, some files are HIPified in place.  The predicate
+    # is_out_of_place tells us if this is the case or not.
+    if not is_out_of_place(filepath):
         return filepath
 
     dirpath, filename = os.path.split(filepath)
@@ -749,17 +458,15 @@ def get_hip_file_path(filepath):
     #
     #   - If the file name contains "CUDA", replace it with "HIP", AND
     #
-    # If NONE of the above occurred, then append "_hip" to the end of
-    # the filename (before the extension).
+    # If NONE of the above occurred, then insert "hip" in the file path
+    # as the direct parent folder of the file
     #
-    # Furthermore, ALWAYS replace '.cu' with '.hip'.
+    # Furthermore, ALWAYS replace '.cu' with '.hip', because those files
+    # contain CUDA kernels that needs to be hipified and processed with
+    # hcc compiler
     #
     # This isn't set in stone; we might adjust this to support other
     # naming conventions.
-    #
-    # In the near future, we intend to also change cu/cuh file extension
-    # to hcc/hcch rather than cc; however, the hcc compiler does not
-    # currently support this file extension.
 
     if ext == '.cu':
         ext = '.hip'
@@ -767,8 +474,13 @@ def get_hip_file_path(filepath):
     orig_dirpath = dirpath
 
     dirpath = dirpath.replace('cuda', 'hip')
+    dirpath = dirpath.replace('THC', 'THH')
+
     root = root.replace('cuda', 'hip')
     root = root.replace('CUDA', 'HIP')
+    # Special case to handle caffe2/core/THCCachingAllocator
+    if dirpath != "caffe2/core":
+        root = root.replace('THC', 'THH')
 
     if dirpath == orig_dirpath:
         dirpath = os.path.join(dirpath, 'hip')
@@ -777,7 +489,11 @@ def get_hip_file_path(filepath):
 
 
 def is_out_of_place(filepath):
-    return not is_pytorch_file(filepath)
+    if filepath.startswith("torch/"):
+        return False
+    if filepath.startswith("tools/autograd/templates/"):
+        return False
+    return True
 
 
 # Keep this synchronized with includes/ignores in build_amd.py
@@ -787,6 +503,8 @@ def is_pytorch_file(filepath):
             return False
         return True
     if filepath.startswith("torch/"):
+        return True
+    if filepath.startswith("tools/autograd/templates/"):
         return True
     return False
 
@@ -833,7 +551,7 @@ class Trie():
                 try:
                     recurse = self._pattern(data[char])
                     alt.append(self.quote(char) + recurse)
-                except:
+                except Exception:
                     cc.append(self.quote(char))
             else:
                 q = 1
@@ -872,12 +590,18 @@ for mapping in CUDA_TO_HIP_MAPPINGS:
         if constants.API_CAFFE2 not in meta_data:
             PYTORCH_TRIE.add(src)
             PYTORCH_MAP[src] = dst
-        CAFFE2_TRIE.add(src)
-        CAFFE2_MAP[src] = dst
+        if constants.API_PYTORCH not in meta_data:
+            CAFFE2_TRIE.add(src)
+            CAFFE2_MAP[src] = dst
 RE_CAFFE2_PREPROCESSOR = re.compile(CAFFE2_TRIE.pattern())
 RE_PYTORCH_PREPROCESSOR = re.compile(r'\b{0}\b'.format(PYTORCH_TRIE.pattern()))
 
-def preprocessor(output_directory, filepath, stats):
+RE_QUOTE_HEADER = re.compile(r'#include "([^"]+)"')
+RE_ANGLE_HEADER = re.compile(r'#include <([^>]+)>')
+RE_THC_GENERIC_FILE = re.compile(r'#define THC_GENERIC_FILE "([^"]+)"')
+RE_CU_SUFFIX = re.compile(r'\.cu\b')  # be careful not to pick up .cuh
+
+def preprocessor(output_directory, filepath, stats, hip_clang_launch):
     """ Executes the CUDA -> HIP conversion on the specified file. """
     fin_path = os.path.join(output_directory, filepath)
     with open(fin_path, 'r') as fin:
@@ -887,39 +611,65 @@ def preprocessor(output_directory, filepath, stats):
     if not os.path.exists(os.path.dirname(fout_path)):
         os.makedirs(os.path.dirname(fout_path))
 
-    with open(fout_path, 'w') as fout:
-        # unsupported_calls statistics reporting is broken atm
-        if is_pytorch_file(filepath):
-            def pt_repl(m):
-                return PYTORCH_MAP[m.group(0)]
-            output_source = RE_PYTORCH_PREPROCESSOR.sub(pt_repl, output_source)
-        else:
-            def c2_repl(m):
-                return CAFFE2_MAP[m.group(0)]
-            output_source = RE_CAFFE2_PREPROCESSOR.sub(c2_repl, output_source)
+    # unsupported_calls statistics reporting is broken atm
+    if is_pytorch_file(filepath):
+        def pt_repl(m):
+            return PYTORCH_MAP[m.group(0)]
+        output_source = RE_PYTORCH_PREPROCESSOR.sub(pt_repl, output_source)
+    else:
+        def c2_repl(m):
+            return CAFFE2_MAP[m.group(0)]
+        output_source = RE_CAFFE2_PREPROCESSOR.sub(c2_repl, output_source)
 
-        # Perform Kernel Launch Replacements
+    # Header rewrites
+    def mk_repl(templ):
+        def repl(m):
+            f = m.group(1)
+            if (
+                f.startswith("ATen/cuda")
+                or f.startswith("ATen/native/cuda")
+                or f.startswith("ATen/native/sparse/cuda")
+                or f.startswith("THC/")
+                or f.startswith("THCUNN/")
+                or (f.startswith("THC") and not f.startswith("THCP"))
+            ):
+                return templ.format(get_hip_file_path(m.group(1)))
+            return m.group(0)
+        return repl
+    output_source = RE_QUOTE_HEADER.sub(mk_repl('#include "{0}"'), output_source)
+    output_source = RE_ANGLE_HEADER.sub(mk_repl('#include <{0}>'), output_source)
+    output_source = RE_THC_GENERIC_FILE.sub(mk_repl('#define THC_GENERIC_FILE "{0}"'), output_source)
+
+    # CMakeLists.txt rewrites
+    if filepath.endswith('CMakeLists.txt'):
+        output_source = output_source.replace('CUDA', 'HIP')
+        output_source = output_source.replace('THC', 'THH')
+        output_source = RE_CU_SUFFIX.sub('.hip', output_source)
+
+    # Perform Kernel Launch Replacements
+    if not hip_clang_launch:
         output_source = processKernelLaunches(output_source, stats)
 
-        # Disable asserts
-        # if not filepath.endswith("THCGeneral.h.in"):
-        #    output_source = disable_asserts(output_source)
+    # Replace std:: with non-std:: versions
+    if filepath.endswith(".cu") or filepath.endswith(".cuh"):
+        output_source = replace_math_functions(output_source)
 
-        # Replace std:: with non-std:: versions
-        if filepath.endswith(".cu") or filepath.endswith(".cuh"):
-          output_source = replace_math_functions(output_source)
+    # Include header if device code is contained.
+    output_source = hip_header_magic(output_source)
 
-        # Replace __forceinline__ with inline
-        output_source = replace_forceinline(output_source)
+    # Replace the extern __shared__
+    output_source = replace_extern_shared(output_source)
 
-        # Include header if device code is contained.
-        output_source = hip_header_magic(output_source)
-
-        # Replace the extern __shared__
-        output_source = replace_extern_shared(output_source)
-
-        fout.write(output_source)
-
+    do_write = True
+    if os.path.exists(fout_path):
+        with open(fout_path, 'r') as fout_old:
+            do_write = fout_old.read() != output_source
+    if do_write:
+        with open(fout_path, 'w') as fout:
+            fout.write(output_source)
+        return "ok"
+    else:
+        return "skipped"
 
 def file_specific_replacement(filepath, search_string, replace_string, strict=False):
     with openf(filepath, "r+") as f:
@@ -950,169 +700,7 @@ def fix_static_global_kernels(in_txt):
     return in_txt
 
 
-# Note [PyTorch and Caffe2 kernel name clobber]
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# For some reason, the static_cast logic in pyHIPIFY assumes all kernels
-# have unique names.  This may be true internally within PyTorch and
-# Caffe2, but it is not true across PyTorch and Caffe2.  The metadata
-# in these cases clobbers each other.
-#
-# To prevent this happening, KernelTemplateParams is distinguished
-# by a boolean saying if it is a PyTorch kernel or a Caffe2 kernel.
-# We can't do a more fine-grained distinction, e.g., the filename,
-# because we need to work on the kernel from files distinct from
-# the one they were originally defined in (that's why this is done
-# in two passes).
-#
-# We can soon kill static_cast handling entirely, as hcc will support
-# this properly.  So don't bother refactoring this code; it will
-# get deleted soon.
-
-
-RE_KERNEL_TEMPLATE = re.compile(r"(template[ ]*<(.*)>\n.*\n?)?__global__ void[\n| ](\w+(\(.*\))?)\(")
-RE_GENERATE_KERNEL = re.compile(r"GENERATE_KERNEL([1-9])\((.*)\)")
-
-
-def get_kernel_template_params(output_directory, the_file, KernelTemplateParams, template_param_to_value):
-    """Scan for __global__ kernel definitions then extract its argument types, and static cast as necessary"""
-    # Read the kernel file.
-    with openf(os.path.join(output_directory, the_file), "r") as f:
-        # Extract all kernels with their templates inside of the file
-        string = f.read()
-
-        get_kernel_definitions = [k for k in RE_KERNEL_TEMPLATE.finditer(string)]
-
-        # Create new launch syntax
-        for kernel in get_kernel_definitions:
-            template_arguments = kernel.group(2).split(",") if kernel.group(2) else ""
-            template_arguments = [x.replace("template", "").replace("typename", "").strip() for x in template_arguments]
-            kernel_name = kernel.group(3)
-
-            # Kernel starting / ending positions
-            arguments_start = kernel.end()
-            argument_start_pos = arguments_start
-            current_position = arguments_start + 1
-
-            # Search for final parenthesis
-            arguments = []
-            closures = {"(": 1, "<": 0}
-            while current_position < len(string):
-                if string[current_position] == "(":
-                    closures["("] += 1
-                elif string[current_position] == ")":
-                    closures["("] -= 1
-                elif string[current_position] == "<":
-                    closures["<"] += 1
-                elif string[current_position] == ">":
-                    closures["<"] -= 1
-
-                # Finished all arguments
-                if closures["("] == 0 and closures["<"] == 0:
-                    # Add final argument
-                    arguments.append({"start": argument_start_pos, "end": current_position})
-                    break
-
-                # Finished current argument
-                if closures["("] == 1 and closures["<"] == 0 and string[current_position] == ",":
-                    arguments.append({"start": argument_start_pos, "end": current_position})
-                    argument_start_pos = current_position + 1
-
-                current_position += 1
-
-            # Grab range of arguments
-            arguments_string = [string[arg["start"]: arg["end"]] for arg in arguments]
-
-            argument_types = [None] * len(arguments_string)
-            for arg_idx, arg in enumerate(arguments_string):
-                for i in range(len(arg) - 1, -1, -1):
-                    if arg[i] == "*" or arg[i] == " ":
-                        argument_types[arg_idx] = re.sub(' +', ' ', arg[0:i + 1].replace("\n", "").strip())
-                        break
-
-            # Here we'll use the template_param_to_value dictionary to replace the PyTorch / Caffe2.
-            if len(template_arguments) == 1 and template_arguments[0].strip() in template_param_to_value.keys():
-                # Updates kernel
-                kernel_with_template = "{0}<{1}>".format(
-                    kernel_name, template_param_to_value[template_arguments[0].strip()])
-            else:
-                kernel_with_template = kernel_name
-            formatted_args = {}
-            for idx, arg_type in enumerate(argument_types):
-                formatted_args[idx] = arg_type
-
-            # See Note [PyTorch and Caffe2 kernel name clobber]
-            KernelTemplateParams[(is_pytorch_file(the_file), kernel_name)] = {"kernel_with_template": kernel_with_template, "arg_types": formatted_args}
-
-        # Extract generated kernels
-        # curandStateMtgp32 *state, int size, T *result, ARG1
-        for kernel in RE_GENERATE_KERNEL.finditer(string):
-            kernel_gen_type = int(kernel.group(1))
-            kernel_name = kernel.group(2).split(",")[0]
-            kernel_params = kernel.group(2).split(",")[1:]
-
-            if kernel_gen_type == 1:
-                kernel_args = {1: "int", 2: "{0} *".format(kernel_params[0]), 3: kernel_params[1]}
-
-            if kernel_gen_type == 2:
-                kernel_args = {1: "int", 2: "{0} *".format(kernel_params[0]), 3: kernel_params[1], 4: kernel_params[2]}
-
-            # Argument at position 1 should be int
-            # See Note [PyTorch and Caffe2 kernel name clobber]
-            KernelTemplateParams[(is_pytorch_file(the_file), kernel_name)] = {"kernel_with_template": kernel_name, "arg_types": kernel_args}
-
-
-def disable_unsupported_function_call(function, input_string, replacement):
-    """Disables calls to an unsupported HIP function"""
-    # Prepare output string
-    output_string = input_string
-
-    # Find all calls to the function
-    calls = re.finditer(r"\b{0}\b".format(re.escape(function)), input_string)
-
-    # Do replacements
-    for call in calls:
-        start = call.start()
-        end = call.end()
-
-        pos = end
-        started_arguments = False
-        bracket_count = 0
-        while pos < len(input_string):
-            if input_string[pos] == "(":
-                if started_arguments is False:
-                    started_arguments = True
-                    bracket_count = 1
-                else:
-                    bracket_count += 1
-            elif input_string[pos] == ")" and started_arguments:
-                bracket_count -= 1
-
-            if bracket_count == 0 and started_arguments:
-                # Finished!
-                break
-            pos += 1
-
-        function_call = input_string[start:pos + 1]
-        output_string = output_string.replace(function_call, replacement)
-
-    return output_string
-
-
 RE_INCLUDE = re.compile(r"#include .*\n")
-
-
-def disable_module(input_file):
-    """Disable a module entirely except for header includes."""
-    with openf(input_file, "r+") as f:
-        txt = f.read()
-        last = list(RE_INCLUDE.finditer(txt))[-1]
-        end = last.end()
-
-        disabled = "{0}#if !defined(__HIP_PLATFORM_HCC__)\n{1}\n#endif".format(txt[0:end], txt[end:])
-
-        f.seek(0)
-        f.write(disabled)
-        f.truncate()
 
 
 def extract_arguments(start, string):
@@ -1161,95 +749,6 @@ def extract_arguments(start, string):
     return arguments
 
 
-RE_HIP_LAUNCH_KERNEL_GGL = re.compile("hipLaunchKernelGGL\(")
-
-
-# Add static_cast to ensure that the type of kernel arguments matches that in the corresponding kernel definition
-def add_static_casts(orig_filepath, filepath, KernelTemplateParams):
-    """Add static casts to kernel launches in order to keep launch argument types and kernel definition types matching.
-
-       Example:
-           old_kernel_launch: ' createBatchGemmBuffer, grid, block, 0, THCState_getCurrentStream(state),
-              (const scalar_t**)d_result, THCTensor_(data)(state, ra__),
-              ra__->stride[0], num_batches'
-
-           new_kernel_launch: ' createBatchGemmBuffer, grid, block, 0, THCState_getCurrentStream(state),
-              (const scalar_t**)d_result, THCTensor_(data)(state, ra__),
-              static_cast<int64_t>(ra__->stride[0]), static_cast<int64_t>(num_batches)'
-    """
-
-    # These are the types that generally have issues with hipKernelLaunch.
-    static_cast_types = ["int", "const int", "int64_t", "THCIndex_t *",
-                         "const int *", "ptrdiff_t", "long", "const int64_t*", "int64_t *", "double"]
-
-    with openf(filepath, "r+") as fileobj:
-        input_source = fileobj.read()
-        new_output_source = input_source
-        for kernel in RE_HIP_LAUNCH_KERNEL_GGL.finditer(input_source):
-            arguments = extract_arguments(kernel.end() - 1, input_source)
-
-            # Check if we have templating + static_cast information
-            argument_strings = [input_source[arg["start"]:arg["end"]] for arg in arguments]
-            original_kernel_name_with_template = argument_strings[0].strip()
-            kernel_name = original_kernel_name_with_template.split("<")[0].strip()
-            ignore = ["upscale"]
-            if (is_pytorch_file(orig_filepath), kernel_name) in KernelTemplateParams and kernel_name not in ignore:
-                # Add template to the kernel
-                # Add static_casts to relevant arguments
-                # See Note [PyTorch and Caffe2 kernel name clobber]
-                params = KernelTemplateParams[(is_pytorch_file(orig_filepath), kernel_name)]
-                kernel_name_with_template = params["kernel_with_template"]
-                argument_types = params["arg_types"]
-
-                # The first 5 arguments are simply (function, number blocks, dimension blocks, shared memory, stream)
-                # old_kernel_launch_parameters - will contain the actual arguments to the function itself.
-                old_kernel_launch_parameters = input_source[arguments[5]["start"]:arguments[-1]["end"]]
-                new_kernel_launch_parameters = old_kernel_launch_parameters
-
-                # full_old_kernel_launch - will contain the entire kernel launch closure.
-                full_old_kernel_launch = input_source[arguments[0]["start"]:arguments[-1]["end"]]
-                full_new_kernel_launch = full_old_kernel_launch
-
-                kernel_params = argument_strings[5:]
-                for arg_idx, arg in enumerate(kernel_params):
-                    if arg_idx in argument_types:
-                        the_type = argument_types[arg_idx]
-                        the_arg = arg.replace("\n", "").replace("\\", "").strip()
-                        # Not all types have issues with the hipLaunchKernelGGL.
-                        if the_type in static_cast_types:
-                            static_argument = "static_cast<{0}>({1})".format(the_type, the_arg)
-
-                            def replace_arg(match):
-                                return match.group(1) + static_argument + match.group(3)
-                            # Update to static_cast, account for cases where argument is at start/end of string
-                            new_kernel_launch_parameters = re.sub(r'(^|\W)({0})(\W|$)'.format(
-                                re.escape(the_arg)), replace_arg, new_kernel_launch_parameters)
-
-                # replace kernel arguments in full kernel launch arguments w/ static_cast ones
-                full_new_kernel_launch = full_new_kernel_launch.replace(
-                    old_kernel_launch_parameters, new_kernel_launch_parameters)
-
-                # PyTorch Specific: Add template type
-                # Here the template value will be resolved from <scalar_t> to <Dtype>.
-                if "THCUNN" in filepath.split("/") and "generic" not in filepath.split("/"):
-                    kernel_name_with_template = kernel_name_with_template.replace("<scalar_t>", "<Dtype>")
-
-                full_new_kernel_launch = re.sub(r'\b{0}\b'.format(re.escape(original_kernel_name_with_template)),
-                                                lambda x: kernel_name_with_template, full_new_kernel_launch)
-
-                # Replace Launch
-                new_output_source = new_output_source.replace(full_old_kernel_launch, full_new_kernel_launch)
-
-        # Overwrite file contents
-        fileobj.seek(0)
-        fileobj.write(new_output_source)
-        fileobj.truncate()
-        fileobj.flush()
-
-        # Flush to disk
-        os.fsync(fileobj)
-
-
 def str2bool(v):
     """ArgumentParser doesn't support type=bool. Thus, this helper method will convert
     from possible string types to True / False."""
@@ -1261,127 +760,16 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def main():
-    """Example invocation
-
-    python hipify.py --project-directory /home/myproject/ --extensions cu cuh h cpp --output-directory /home/gains/
-    """
-
-    parser = argparse.ArgumentParser(
-        description="The Python Hipify Script.")
-
-    # required argument: user has to specify it before proceed
-    # this is to avoid accidentally hipify files that are not intended
-    parser.add_argument(
-        '--project-directory',
-        type=str,
-        default=os.getcwd(),
-        help="The root of the project.",
-        required=True)
-
-    parser.add_argument(
-        '--show-detailed',
-        type=str2bool,
-        default=False,
-        help="Show detailed summary of the hipification process.",
-        required=False)
-
-    parser.add_argument(
-        '--extensions',
-        nargs='+',
-        default=[".cu", ".cuh", ".c", ".cpp", ".h", ".in", ".hpp"],
-        help="The extensions for files to run the Hipify script over.",
-        required=False)
-
-    parser.add_argument(
-        '--output-directory',
-        type=str,
-        default="",
-        help="The directory to store the hipified project.",
-        required=False)
-
-    parser.add_argument(
-        '--includes',
-        nargs='+',
-        default=[],
-        help="The patterns of files that should be included.",
-        required=False)
-
-    parser.add_argument(
-        '--json-settings',
-        type=str,
-        default="",
-        help="The json file storing information for disabled functions and modules.",
-        required=False)
-
-    parser.add_argument(
-        '--add-static-casts',
-        type=str2bool,
-        default=False,
-        help="Whether to automatically add static_casts to kernel arguments.",
-        required=False)
-
-    parser.add_argument(
-        '--out-of-place-only',
-        type=str2bool,
-        default=False,
-        help="Whether to only run hipify out-of-place on source files",
-        required=False),
-
-    parser.add_argument(
-        '--ignores',
-        nargs='+',
-        default=[],
-        help="list of patterns to ignore for hipifying")
-
-    parser.add_argument(
-        '--show-progress',
-        type=str2bool,
-        default=True,
-        help="Whether to show the progress bar during the transpilation proecss.",
-        required=False)
-
-    parser.add_argument(
-        '--hip-suffix',
-        type=str,
-        default='cc',
-        help="The suffix for the hipified files",
-        required=False)
-
-    parser.add_argument(
-        '--extensions-to-hip-suffix',
-        type=str,
-        default=('cc', 'cu'),
-        help="Specify the file extensions whose suffix will be changed "
-        + "to the new hip suffix",
-        required=False)
-
-    args = parser.parse_args()
-
-    hipify(
-        project_directory=args.project_directory,
-        show_detailed=args.show_detailed,
-        extensions=args.extensions,
-        output_directory=args.output_directory,
-        includes=args.includes,
-        json_settings=args.json_settings,
-        add_static_casts_option=args.add_static_casts,
-        out_of_place_only=args.out_of_place_only,
-        ignores=args.ignores,
-        show_progress=args.show_progress)
-
-
 def hipify(
     project_directory,
     show_detailed=False,
     extensions=(".cu", ".cuh", ".c", ".cc", ".cpp", ".h", ".in", ".hpp"),
     output_directory="",
     includes=(),
-    json_settings="",
-    add_static_casts_option=False,
     out_of_place_only=False,
     ignores=(),
     show_progress=True,
+    hip_clang_launch=False,
 ):
     if project_directory == "":
         project_directory = os.getcwd()
@@ -1400,94 +788,6 @@ def hipify(
     if not os.path.exists(output_directory):
         shutil.copytree(project_directory, output_directory)
 
-    # Open JSON file with disable information.
-    if json_settings != "":
-        with openf(json_settings, "r") as f:
-            json_data = json.load(f)
-
-        # Disable functions in certain files according to JSON description
-        for disable_info in json_data["disabled_functions"]:
-            filepath = os.path.join(output_directory, disable_info["path"])
-            if "functions" in disable_info:
-                functions = disable_info["functions"]
-            else:
-                functions = disable_info.get("functions", [])
-
-            if "non_hip_functions" in disable_info:
-                non_hip_functions = disable_info["non_hip_functions"]
-            else:
-                non_hip_functions = disable_info.get("non_hip_functions", [])
-
-            if "non_device_functions" in disable_info:
-                not_on_device_functions = disable_info["non_device_functions"]
-            else:
-                not_on_device_functions = disable_info.get("non_device_functions", [])
-
-            with openf(filepath, "r+") as f:
-                txt = f.read()
-                for func in functions:
-                    # TODO - Find fix assertions in HIP for device code.
-                    txt = disable_function(txt, func, disablefuncmode.ASSERT)
-
-                for func in non_hip_functions:
-                    # Disable this function on HIP stack
-                    txt = disable_function(txt, func, disablefuncmode.HCC_MACRO)
-
-                for func in not_on_device_functions:
-                    # Disable this function when compiling on Device
-                    txt = disable_function(txt, func, disablefuncmode.DEVICE_MACRO)
-
-                f.seek(0)
-                f.write(txt)
-                f.truncate()
-
-        # Disable modules
-        disable_modules = json_data["disabled_modules"]
-        for module in disable_modules:
-            disable_module(os.path.join(output_directory, module))
-
-        # Disable unsupported HIP functions
-        for disable in json_data["disable_unsupported_hip_calls"]:
-            filepath = os.path.join(output_directory, disable["path"])
-            if "functions" in disable:
-                functions = disable["functions"]
-            else:
-                functions = disable.get("functions", [])
-
-            if "constants" in disable:
-                constants = disable["constants"]
-            else:
-                constants = disable.get("constants", [])
-
-            if "s_constants" in disable:
-                s_constants = disable["s_constants"]
-            else:
-                s_constants = disable.get("s_constants", [])
-
-            if not os.path.exists(filepath):
-                print("\n" + bcolors.WARNING + "JSON Warning: File {0} does not exist.".format(filepath) + bcolors.ENDC)
-                continue
-
-            with openf(filepath, "r+") as f:
-                txt = f.read()
-
-                # Disable HIP Functions
-                for func in functions:
-                    txt = disable_unsupported_function_call(func, txt, functions[func])
-
-                # Disable Constants w\ Boundary.
-                for const in constants:
-                    txt = re.sub(r"\b{0}\b".format(re.escape(const)), constants[const], txt)
-
-                # Disable Constants
-                for s_const in s_constants:
-                    txt = txt.replace(s_const, s_constants[s_const])
-
-                # Save Changes
-                f.seek(0)
-                f.write(txt)
-                f.truncate()
-
     all_files = list(matched_files_iter(output_directory, includes=includes,
                                         ignores=ignores, extensions=extensions,
                                         out_of_place_only=out_of_place_only))
@@ -1497,27 +797,5 @@ def hipify(
         output_directory,
         all_files,
         show_detailed=show_detailed,
-        show_progress=show_progress)
-
-    # Extract all of the kernel parameter and template type information.
-    if add_static_casts_option:
-        KernelTemplateParams = {}
-        for filepath in all_files:
-            get_kernel_template_params(
-                output_directory,
-                filepath,
-                KernelTemplateParams,
-                CAFFE2_TEMPLATE_MAP if not is_pytorch_file(filepath) else PYTORCH_TEMPLATE_MAP)
-
-        # Execute the Clang Tool to Automatically add static casts
-        for filepath in all_files:
-            add_static_casts(
-                filepath,
-                os.path.join(
-                    output_directory,
-                    get_hip_file_path(filepath)),
-                KernelTemplateParams)
-
-
-if __name__ == '__main__':
-    main()
+        show_progress=show_progress,
+        hip_clang_launch=hip_clang_launch)

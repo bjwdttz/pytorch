@@ -1,8 +1,8 @@
 #ifndef THC_HALF_AUTO_NUMERICS_INC
 #define THC_HALF_AUTO_NUMERICS_INC
 
-#include "TH/THHalf.h"
-#include "THCNumerics.cuh"
+#include <TH/THHalf.h>
+#include <THC/THCNumerics.cuh>
 
 // WARNING: THCNumerics is being deprecated. Read the comments and function usage
 //          in THCNumerics to learn about the deprecation
@@ -49,10 +49,6 @@ inline __host__ __device__ THHalf log1p(THHalf a) {
 
 inline __host__ __device__ THHalf log2(THHalf a) {
   return THCNumerics<THHalf>::log2(a);
-}
-
-inline __host__ __device__ THHalf expm1(THHalf a) {
-  return THCNumerics<THHalf>::expm1(a);
 }
 
 inline __host__ __device__ THHalf pow(THHalf a, THHalf b) {

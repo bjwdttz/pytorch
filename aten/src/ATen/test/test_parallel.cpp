@@ -1,4 +1,4 @@
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 
 #include <ATen/ATen.h>
 #include <ATen/DLConvertor.h>
@@ -50,4 +50,22 @@ TEST(TestParallel, Exceptions) {
       throw std::runtime_error("exception");
     }),
     std::runtime_error);
+}
+
+TEST(TestParallel, IntraOpLaunchFuture) {
+  int v1 = 0;
+  int v2 = 0;
+
+  auto fut1 = at::intraop_launch_future([&v1](){
+    v1 = 1;
+  });
+
+  auto fut2 = at::intraop_launch_future([&v2](){
+    v2 = 2;
+  });
+
+  fut1->wait();
+  fut2->wait();
+
+  ASSERT_TRUE(v1 == 1 && v2 == 2);
 }

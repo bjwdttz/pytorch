@@ -1,10 +1,18 @@
 #ifndef TH_GENERIC_FILE
-#define TH_GENERIC_FILE "generic/serialization.cpp"
+#define TH_GENERIC_FILE "torch/csrc/generic/serialization.cpp"
 #else
+
+#ifdef THC_GENERIC_FILE
+#include <c10/cuda/CUDAGuard.h>
+#endif
 
 template <class io>
 void THPStorage_(writeFileRaw)(THWStorage *self, io fd)
 {
+#ifdef THC_GENERIC_FILE
+  c10::cuda::CUDAGuard guard(self->device());
+#endif
+
   scalar_t *data;
   int64_t size = THWStorage_(size)(LIBRARY_STATE self);
 #ifndef THC_GENERIC_FILE
@@ -14,7 +22,13 @@ void THPStorage_(writeFileRaw)(THWStorage *self, io fd)
   data = (scalar_t*)cpu_data.get();
   THCudaCheck(cudaMemcpy(data, THWStorage_(data)(LIBRARY_STATE self), size * sizeof(scalar_t), cudaMemcpyDeviceToHost));
 #endif
-  doWrite(fd, &size, sizeof(int64_t));
+  if (THP_nativeByteOrder() == THPByteOrder::THP_LITTLE_ENDIAN)
+    doWrite(fd, &size, sizeof(int64_t));
+  else {
+    int64_t nsize; // convert big endian cpu to little endian storage
+    THP_encodeInt64Buffer((uint8_t*)&nsize, (const int64_t *)&size, THPByteOrder::THP_LITTLE_ENDIAN, 1);
+    doWrite(fd, &nsize, sizeof(int64_t));
+  }
   // fast track for bytes and little endian
   if (sizeof(scalar_t) == 1 || THP_nativeByteOrder() == THPByteOrder::THP_LITTLE_ENDIAN) {
     doWrite(fd, data, sizeof(scalar_t) * size);
@@ -50,9 +64,21 @@ template void THPStorage_(writeFileRaw<PyObject*>)(THWStorage *self, PyObject* f
 template <class io>
 THWStorage * THPStorage_(readFileRaw)(io file, THWStorage *_storage)
 {
+#ifdef THC_GENERIC_FILE
+  c10::cuda::OptionalCUDAGuard guard;
+  if (_storage != nullptr) {
+    guard.set_device(_storage->device());
+  }
+#endif
+
   scalar_t *data;
   int64_t size;
   doRead(file, &size, sizeof(int64_t));
+  if (THP_nativeByteOrder() == THPByteOrder::THP_BIG_ENDIAN) {
+    int64_t nsize; // convert little endian storage to big endian cpu
+    nsize = size;
+    THP_decodeInt64Buffer(&size, (const uint8_t*)&nsize, THP_nativeByteOrder(), 1);
+  }
   THWStoragePtr storage;
   if (_storage == nullptr) {
     storage = THWStorage_(newWithSize)(LIBRARY_STATE size);
@@ -85,17 +111,17 @@ THWStorage * THPStorage_(readFileRaw)(io file, THWStorage *_storage)
       if (sizeof(scalar_t) == 2) {
         THP_decodeInt16Buffer((int16_t*)data + i,
             le_buffer.get(),
-            THPByteOrder::THP_LITTLE_ENDIAN,
+            THP_nativeByteOrder(),
             to_convert);
       } else if (sizeof(scalar_t) == 4) {
         THP_decodeInt32Buffer((int32_t*)data + i,
             le_buffer.get(),
-            THPByteOrder::THP_LITTLE_ENDIAN,
+            THP_nativeByteOrder(),
             to_convert);
       } else if (sizeof(scalar_t) == 8) {
         THP_decodeInt64Buffer((int64_t*)data + i,
             le_buffer.get(),
-            THPByteOrder::THP_LITTLE_ENDIAN,
+            THP_nativeByteOrder(),
             to_convert);
       }
     }

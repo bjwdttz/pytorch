@@ -1,17 +1,24 @@
 import sys
 import torch
 import torch._C as _C
+from torch._namedtensor_internals import update_names, check_serializing_named_tensor, resolve_ellipsis
+from torch._namedtensor_internals import unzip_namedshape
 from collections import OrderedDict
 import torch.utils.hooks as hooks
 import warnings
 import weakref
 from torch._six import imap
 from torch._C import _add_docstr
+from numbers import Number
 
 
 # NB: If you subclass Tensor, and want to share the subclassed class
 # across processes, you must also update torch/multiprocessing/reductions.py
 # to define a ForkingPickler serialization mode for the class.
+#
+# NB: If you add a new method to Tensor, you must update
+# torch/__init__.py.in to add a type annotation for your method;
+# otherwise, it will not show up in autocomplete.
 class Tensor(torch._C._TensorBase):
     def __deepcopy__(self, memo):
         if not self.is_leaf:
@@ -31,15 +38,40 @@ class Tensor(torch._C._TensorBase):
             return new_tensor
 
     def __reduce_ex__(self, proto):
+        check_serializing_named_tensor(self)
         # See Note [Don't serialize hooks]
         torch.utils.hooks.warn_if_has_hooks(self)
-        args = (self.storage(),
-                self.storage_offset(),
-                tuple(self.size()),
-                self.stride(),
-                self.requires_grad,
-                OrderedDict())  # previously was self._backward_hooks
-        return (torch._utils._rebuild_tensor_v2, args)
+        if self.is_quantized:
+            if self.qscheme() == torch.per_tensor_affine:
+                quantizer_params = (torch.per_tensor_affine,
+                                    self.q_scale(),
+                                    self.q_zero_point())
+            elif self.qscheme() == torch.per_channel_affine:
+                # convert scales and zero points to tuple to avoid recursive calls
+                # when/if we get multi-axis quantized tensors in the future, the shape
+                # is recoverable from the main tensor shape
+                quantizer_params = (torch.per_channel_affine,
+                                    [e.item() for e in self.q_per_channel_scales().reshape(-1)],
+                                    [e.item() for e in self.q_per_channel_zero_points().reshape(-1)],
+                                    self.q_per_channel_axis())
+            else:
+                raise RuntimeError("Serialization is not supported for tensors of type {}".format(self.qscheme()))
+            args = (self.storage(),
+                    self.storage_offset(),
+                    tuple(self.size()),
+                    self.stride(),
+                    quantizer_params,
+                    self.requires_grad,
+                    OrderedDict())
+            return (torch._utils._rebuild_qtensor, args)
+        else:
+            args = (self.storage(),
+                    self.storage_offset(),
+                    tuple(self.size()),
+                    self.stride(),
+                    self.requires_grad,
+                    OrderedDict())  # previously was self._backward_hooks
+            return (torch._utils._rebuild_tensor_v2, args)
 
     def __setstate__(self, state):
         # Warning: this method is NOT called when you torch.load() a tensor;
@@ -175,9 +207,17 @@ class Tensor(torch._C._TensorBase):
 
     .. note::
 
-      Returned Tensor uses the same data tensor as the original one.
+      Returned Tensor shares the same storage with the original one.
       In-place modifications on either of them will be seen, and may trigger
       errors in correctness checks.
+      IMPORTANT NOTE: Previously, in-place size / stride / storage changes
+      (such as `resize_` / `resize_as_` / `set_` / `transpose_`) to the returned tensor
+      also update the original tensor. Now, these in-place changes will not update the
+      original tensor anymore, and will instead trigger an error.
+      For sparse tensors:
+      In-place indices / values changes (such as `zero_` / `copy_` / `add_`) to the
+      returned tensor will not update the original tensor anymore, and will instead
+      trigger an error.
     """)
 
     detach_ = _add_docstr(_C._TensorBase.detach_, r"""
@@ -207,11 +247,6 @@ class Tensor(torch._C._TensorBase):
         self.register_hook(retain_grad_hook)
         self.retains_grad = True
 
-    def is_pinned(self):
-        r"""Returns true if this tensor resides in pinned memory"""
-        storage = self.storage()
-        return storage.is_pinned() if storage else False
-
     def is_shared(self):
         r"""Checks if tensor is in shared memory.
 
@@ -235,42 +270,18 @@ class Tensor(torch._C._TensorBase):
         else:
             return self.flip(0)
 
-    def argmax(self, dim=None, keepdim=False):
-        r"""See :func:`torch.argmax`"""
-        return torch.argmax(self, dim, keepdim)
+    def norm(self, p="fro", dim=None, keepdim=False, dtype=None):
+        r"""See :func:`torch.norm`"""
+        return torch.norm(self, p, dim, keepdim, dtype=dtype)
 
-    def argmin(self, dim=None, keepdim=False):
-        r"""See :func:`torch.argmin`"""
-        return torch.argmin(self, dim, keepdim)
-
-    def argsort(self, dim=None, descending=False):
-        r"""See :func: `torch.argsort`"""
-        return torch.argsort(self, dim, descending)
-
-    def norm(self, p="fro", dim=None, keepdim=False):
-        r"""See :func: `torch.norm`"""
-        return torch.norm(self, p, dim, keepdim)
-
-    def btrifact(self, info=None, pivot=True):
-        r"""See :func:`torch.btrifact`
-        """
-        if info is not None:
-            warnings.warn("info option in btrifact is deprecated and will be removed in v0.4, "
-                          "consider using btrifact_with_info instead", stacklevel=2)
-            factorization, pivots, _info = super(Tensor, self).btrifact_with_info(pivot=pivot)
-            if info.type() != _info.type():
-                raise ValueError('btrifact expects info to be an IntTensor')
-            info.resize_as_(_info).copy_(_info)
-            return factorization, pivots
+    def lu(self, pivot=True, get_infos=False):
+        r"""See :func:`torch.lu`"""
+        # If get_infos is True, then we don't need to check for errors and vice versa
+        LU, pivots, infos = torch._lu_with_info(self, pivot=pivot, check_errors=(not get_infos))
+        if get_infos:
+            return LU, pivots, infos
         else:
-            return super(Tensor, self).btrifact(pivot=pivot)
-
-    def potrf(self, upper=True):
-        r"""See :func:`torch.cholesky`"""
-        warnings.warn("torch.potrf is deprecated in favour of torch.cholesky and will be removed "
-                      "in the next release. Please use torch.cholesky instead and note that the "
-                      ":attr:`upper` argument in torch.cholesky defaults to ``False``.", stacklevel=2)
-        return super(Tensor, self).cholesky(upper=upper)
+            return LU, pivots
 
     def stft(self, n_fft, hop_length=None, win_length=None, window=None,
              center=True, pad_mode='reflect', normalized=False, onesided=True):
@@ -301,63 +312,19 @@ class Tensor(torch._C._TensorBase):
         else:
             return super(Tensor, self).split_with_sizes(split_size, dim)
 
-    def index_add(self, dim, index, tensor):
-        r"""Out-of-place version of :meth:`torch.Tensor.index_add_`
-        """
-        return self.clone().index_add_(dim, index, tensor)
-
-    def index_copy(self, dim, index, tensor):
-        r"""Out-of-place version of :meth:`torch.Tensor.index_copy_`
-        """
-        return self.clone().index_copy_(dim, index, tensor)
-
-    def index_fill(self, dim, index, value):
-        r"""Out-of-place version of :meth:`torch.Tensor.index_fill_`
-        """
-        return self.clone().index_fill_(dim, index, value)
-
-    def scatter(self, dim, index, source):
-        r"""Out-of-place version of :meth:`torch.Tensor.scatter_`
-        """
-        return self.clone().scatter_(dim, index, source)
-
-    def scatter_add(self, dim, index, source):
-        r"""Out-of-place version of :meth:`torch.Tensor.scatter_add_`
-        """
-        return self.clone().scatter_add_(dim, index, source)
-
-    def masked_scatter(self, mask, tensor):
-        r"""Out-of-place version of :meth:`torch.Tensor.masked_scatter_`
-        """
-        return self.clone().masked_scatter_(mask, tensor)
-
-    def masked_fill(self, mask, value):
-        r"""Out-of-place version of :meth:`torch.Tensor.masked_fill_`
-        """
-        return self.clone().masked_fill_(mask, value)
-
-    def unique(self, sorted=False, return_inverse=False, dim=None):
-        r"""Returns the unique scalar elements of the tensor as a 1-D tensor.
+    def unique(self, sorted=True, return_inverse=False, return_counts=False, dim=None):
+        r"""Returns the unique elements of the input tensor.
 
         See :func:`torch.unique`
         """
-        if dim is not None:
-            output, inverse_indices = torch._unique_dim(
-                self,
-                sorted=sorted,
-                return_inverse=return_inverse,
-                dim=dim
-            )
-        else:
-            output, inverse_indices = torch._unique(
-                self,
-                sorted=sorted,
-                return_inverse=return_inverse
-            )
-        if return_inverse:
-            return output, inverse_indices
-        else:
-            return output
+        return torch.unique(self, sorted=sorted, return_inverse=return_inverse, return_counts=return_counts, dim=dim)
+
+    def unique_consecutive(self, return_inverse=False, return_counts=False, dim=None):
+        r"""Eliminates all but the first element from every consecutive group of equivalent elements.
+
+        See :func:`torch.unique_consecutive`
+        """
+        return torch.unique_consecutive(self, return_inverse=return_inverse, return_counts=return_counts, dim=dim)
 
     def __rsub__(self, other):
         return _C._VariableFunctions.rsub(self, other)
@@ -382,7 +349,7 @@ class Tensor(torch._C._TensorBase):
         raise NotImplementedError("in-place pow not implemented")
 
     def __rpow__(self, other):
-        return self.new([other]) ** self
+        return self.new_tensor(other) ** self
 
     def __floordiv__(self, other):
         result = self / other
@@ -459,6 +426,21 @@ class Tensor(torch._C._TensorBase):
             array = array.astype('uint8')
         return torch.from_numpy(array)
 
+    def __contains__(self, element):
+        r"""Check if `element` is present in tensor
+
+        Arguments:
+            element (Tensor or scalar): element to be checked
+                for presence in current tensor"
+        """
+        if isinstance(element, (torch.Tensor, Number)):
+            return (element == self).any().item()
+
+        raise RuntimeError(
+            "Tensor.__contains__ only supports Tensor or scalar, but you passed in a %s." %
+            type(element)
+        )
+
     @property
     def __cuda_array_interface__(self):
         """Array view description for cuda tensors.
@@ -505,10 +487,41 @@ class Tensor(torch._C._TensorBase):
 
         itemsize = self.storage().element_size()
 
-        shape = self.shape
+        shape = tuple(self.shape)
         strides = tuple(s * itemsize for s in self.stride())
         data = (self.data_ptr(), False)  # read-only is false
 
-        return dict(typestr=typestr, shape=shape, strides=strides, data=data, version=0)
+        return dict(typestr=typestr, shape=shape, strides=strides, data=data, version=1)
+
+    def refine_names(self, *names):
+        names = resolve_ellipsis(names, self.names, 'refine_names')
+        return super(Tensor, self).refine_names(names)
+
+    def align_to(self, *names):
+        return super(Tensor, self).align_to(
+            resolve_ellipsis(names, self.names, 'align_to', is_positional=False))
+
+    def unflatten(self, dim, namedshape):
+        names, sizes = unzip_namedshape(namedshape)
+        return super(Tensor, self).unflatten(dim, sizes, names)
+
+    def rename_(self, *names, **rename_map):
+        # Note [rename_ / rename API]
+        # The Python API for these is different from the C++ API. In Python:
+        # 1) tensor.rename(*names) takes a vararglist of names
+        # 2) tensor.rename(**rename_map) takes a map of names to rename.
+        # C++ is static, making it difficult to implement similar behavior.
+        return update_names(self, names, rename_map, inplace=True)
+
+    def rename(self, *names, **rename_map):
+        # See Note [rename_ / rename API]
+        return update_names(self, names, rename_map, inplace=False)
+
+    def _update_names(self, names, inplace):
+        # See Note [rename_ / rename API]
+        if inplace:
+            return super(Tensor, self).rename_(names)
+        else:
+            return super(Tensor, self).rename(names)
 
     __module__ = 'torch'

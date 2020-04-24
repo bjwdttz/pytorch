@@ -5,32 +5,37 @@ import collections
 import caffe2.python.hypothesis_test_util as hu
 import hypothesis.strategies as st
 import numpy as np
-from caffe2.python import core, dyndep
+from caffe2.python import core, dyndep, workspace
 from dnnlowp_test_utils import check_quantized_results_close
 from hypothesis import given
 
 
 dyndep.InitOpsLibrary("//caffe2/caffe2/quantization/server:dnnlowp_ops")
+workspace.GlobalInit(["caffe2", "--caffe2_omp_num_threads=11"])
 
 
 class DNNLowPElementwiseLinearOpTest(hu.HypothesisTestCase):
     @given(
         N=st.integers(32, 256),
         D=st.integers(32, 256),
+        empty_batch=st.booleans(),
         in_quantized=st.booleans(),
         out_quantized=st.booleans(),
         **hu.gcs_cpu_only
     )
     def test_dnnlowp_elementwise_linear_int(
-        self, N, D, in_quantized, out_quantized, gc, dc
+        self, N, D, empty_batch, in_quantized, out_quantized, gc, dc
     ):
+        if empty_batch:
+            N = 0
         # All inputs have scale 1, so exactly represented after quantization
         min_ = -100
         max_ = min_ + 255
         X = np.round(np.random.rand(N, D) * (max_ - min_) + min_)
         X = X.astype(np.float32)
-        X[0, 0] = min_
-        X[0, 1] = max_
+        if N != 0:
+            X[0, 0] = min_
+            X[0, 1] = max_
 
         a = np.round(np.random.rand(D) * 255 - 128).astype(np.float32)
         a[0] = -128

@@ -5,16 +5,17 @@ import collections
 import caffe2.python.hypothesis_test_util as hu
 import hypothesis.strategies as st
 import numpy as np
-from caffe2.python import core, dyndep
+from caffe2.python import core, dyndep, workspace
 from hypothesis import given
 
 
 dyndep.InitOpsLibrary("//caffe2/caffe2/quantization/server:dnnlowp_ops")
+workspace.GlobalInit(["caffe2", "--caffe2_omp_num_threads=11"])
 
 
 class DNNLowPLSTMUnitOpTest(hu.HypothesisTestCase):
     @given(
-        N=st.integers(4, 64),
+        N=st.integers(0, 64),
         D=st.integers(4, 64),
         forget_bias=st.integers(0, 4),
         **hu.gcs_cpu_only

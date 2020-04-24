@@ -4,6 +4,7 @@
 #include <torch/utils.h>
 
 #include <cstddef>
+#include <ostream>
 #include <utility>
 #include <vector>
 
@@ -13,19 +14,23 @@ namespace nn {
 EmbeddingOptions::EmbeddingOptions(int64_t count, int64_t dimension)
     : count_(count), dimension_(dimension) {}
 
-EmbeddingImpl::EmbeddingImpl(EmbeddingOptions options)
-    : options(std::move(options)) {
+EmbeddingImpl::EmbeddingImpl(EmbeddingOptions options) : options(options) {
   reset();
 }
 
 void EmbeddingImpl::reset() {
   weight = register_parameter(
-      "weight", torch::empty({options.count_, options.dimension_}));
+      "weight", torch::empty({options.count(), options.dimension()}));
   NoGradGuard guard;
   weight.normal_(0, 1);
 }
 
-Tensor EmbeddingImpl::forward(Tensor input) {
+void EmbeddingImpl::pretty_print(std::ostream& stream) const {
+  stream << "torch::nn::Embedding(count=" << options.count()
+         << ", dimension=" << options.dimension() << ")";
+}
+
+Tensor EmbeddingImpl::forward(const Tensor& input) {
   return torch::embedding(weight, /*indices=*/input);
 }
 } // namespace nn

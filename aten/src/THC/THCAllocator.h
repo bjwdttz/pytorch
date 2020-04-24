@@ -1,11 +1,10 @@
 #ifndef THC_ALLOCATOR_INC
 #define THC_ALLOCATOR_INC
 
-#include "THCGeneral.h"
+#include <THC/THCGeneral.h>
 
 // IPC doesn't support (re)allocation
 
-#ifdef __cplusplus
 class CAFFE2_API THCIpcDeleter {
  public:
   THCIpcDeleter(std::shared_ptr<void> basePtr);
@@ -14,6 +13,5 @@ class CAFFE2_API THCIpcDeleter {
 private:
   std::shared_ptr<void> basePtr_;
 };
-#endif
 
 #endif

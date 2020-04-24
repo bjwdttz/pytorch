@@ -1,103 +1,250 @@
-#include "dead_code_elimination.h"
+#include <torch/csrc/jit/passes/dead_code_elimination.h>
 
-#include "torch/csrc/jit/passes/alias_analysis.h"
+#include <torch/csrc/jit/ir_views.h>
+#include <torch/csrc/jit/jit_log.h>
+#include <torch/csrc/jit/passes/alias_analysis.h>
+#include <torch/csrc/utils/memory.h>
 
 #include <unordered_map>
 
 namespace torch {
 namespace jit {
 
+namespace prim {
+using namespace ::c10::prim;
+}
+
 class DeadCodeEliminator {
  public:
-  explicit DeadCodeEliminator(std::shared_ptr<Graph> graph)
-      : aliasDb_(AliasAnalysis(graph)) {}
-  DeadCodeEliminator(bool collect_only = false)
-      : collect_only_(collect_only) {}
+  explicit DeadCodeEliminator(std::shared_ptr<Graph> graph, DCESideEffectPolicy sideEffectPolicy)
+      : sideEffectPolicy_(sideEffectPolicy), aliasDb_(torch::make_unique<AliasDb>(std::move(graph))) {}
+  DeadCodeEliminator(DCESideEffectPolicy sideEffectPolicy)
+  : sideEffectPolicy_(sideEffectPolicy) {}
 
   // The algorithm is an inverse mark-and-sweep. Starting from the return node,
   // we mark "live" nodes that are necessary for the output. Nodes that have
   // side effects are also marked.
   void run(Block* block, bool recurse) {
-    // Find the last wildcard in the block. We cannot eliminate any mutable ops
-    // that precede the last wildcard.
-    setLastWildcard();
+    // clean up unused fork inputs before starting the main algorithm
+    eliminateDeadForkInputs(block, recurse);
 
-    // Initialize by adding the return node to work list
-    markAndEnqueue(block->return_node());
+    // Initialize by marking the return node and all its consumed values as live
+    mark(block->return_node());
 
     mark(block);
+
+    deleteCallback_(liveValues_);
+
     sweep(block, recurse);
   }
 
-  // *_once, because it should be called only once per run() call.
-  std::unordered_set<Node*> get_dead_once() {
-    JIT_ASSERT(collect_only_);
-    return std::move(dead_nodes_);
+  void setDeleteCallback(
+      std::function<void(const std::unordered_set<const Value*>&)>
+          deleteCallback) {
+    deleteCallback_ = std::move(deleteCallback);
   }
 
  private:
-  void setLastWildcard() {
-    if (!aliasDb_) {
-      return;
-    }
-
-    const auto& wildcards = aliasDb_->getWildcardNodes();
-    if (wildcards.empty()) {
-      return;
-    }
-
-    lastWildcard_ = *wildcards.begin();
-    for (const auto wildcard : wildcards) {
-      if (wildcard->isAfter(*lastWildcard_)) {
-        lastWildcard_ = wildcard;
+  void eliminateDeadForkInputs(Block* block, bool recurse) {
+    for (Node* node : block->nodes()) {
+      if (recurse) {
+        for (Block* sb : node->blocks()) {
+          eliminateDeadForkInputs(sb, recurse);
+        }
+      }
+      if (node->kind() != prim::fork) {
+        continue;
+      }
+      Graph& g = *node->g(attr::Subgraph);
+      for (size_t i = 0; i < g.inputs().size(); ++i) {
+        if (!g.inputs().at(i)->hasUses()) {
+          GRAPH_UPDATE(
+              "Dead ",
+              i,
+              "-th input ",
+              node->inputs().at(i)->debugName(),
+              "(",
+              g.inputs().at(i)->debugName(),
+              " in a subgraph) will be removed");
+          g.eraseInput(i);
+          node->removeInput(i);
+        }
       }
     }
   }
 
-  void mark(Block* block) {
+  // Special handling for block return nodes. Unlike other nodes, the block
+  // return node doesn't really "use" its inputs. Consider:
+  //
+  // %a0 = aten::foo()
+  // %b = aten::foo()
+  // %a2, %b2 = prim::If(%cond) {
+  //   block0() {
+  //     %a1 = aten::foo(%.0)
+  //     %b1 = aten::foo(%b)
+  //   } -> (%a1, %b1)
+  // }
+  // return (%a2)
+  //
+  // We want to be able to DCE all the %b stuff. So when processing block
+  // returns, we only mark producers for values that "live" (i.e. used outside
+  // the block).
+  //
+  // Returns true iff this marked something we haven't marked before.
+  bool markReturnNode(Node* node) {
+    if (marked_.count(node)) {
+      return false;
+    }
+
+    AT_ASSERT(node->owningBlock()->return_node() == node);
+    auto outerNode = node->owningBlock()->owningNode();
+    if (outerNode == nullptr || outerNode->kind() == prim::Reverse) {
+      // If there's no outer node, we're looking at the graph's top-level
+      // return block. We consider all graph outputs to be "used", so just mark
+      // this node normally.
+      return mark(node);
+    }
+
+    // Collect all inputs that are actually live
+    if (outerNode->kind() == prim::Loop ||
+        outerNode->kind() == c10::onnx::Loop) {
+      // Special handling to deal with loop carried dependencies.
+      auto loop = LoopView(outerNode);
+      for (size_t i = 0; i < loop.carriedOutputs().size(); i++) {
+        auto innerInput = loop.bodyCarriedInputs().at(i);
+        auto innerOutput = loop.bodyCarriedOutputs().at(i);
+        auto outerOutput = loop.carriedOutputs().at(i);
+        if (liveValues_.count(outerOutput) || innerInput->hasUses()) {
+          liveValues_.insert(innerOutput);
+        }
+      }
+
+      // Also mark the loop next condition as live, since it will be used inside
+      // the loop body.
+      liveValues_.insert(loop.nextCond());
+    } else {
+      AT_ASSERT(outerNode->outputs().size() == node->inputs().size());
+      for (size_t i = 0; i < outerNode->outputs().size(); i++) {
+        auto innerOutput = node->inputs()[i];
+        auto outerOutput = outerNode->outputs()[i];
+        if (liveValues_.count(outerOutput)) {
+          liveValues_.insert(innerOutput);
+        }
+      }
+    }
+
+    marked_.insert(node);
+    return true;
+  }
+
+  // Loops are special, because we need to run them to convergence.
+  // Consider the following loop:
+  //   for i in range(3):
+  //     tot += a[0][0]
+  //     b = a[0]
+  //     b[0] += 1
+  //   print(tot)
+  //
+  // If we only process the loop block once, we will conclude that `b[0]` and
+  // `b` are dead, even though `b[0] += 1` mutates a live memory location (since
+  // `b[0]` is an alias of `a`). i.e. `a` is used to compute `tot` in the next
+  // iteration
+  //
+  // We need to mark the loop again with the information that `a` is live, and
+  // repeat until we're not marking new stuff anymore.
+  //
+  // Returns true iff this marked something we haven't marked before.
+  bool markLoop(Node* node) {
+    TORCH_INTERNAL_ASSERT(node->kind() == prim::Loop);
+    // Did a single iteration over the loop block mark anything new?
+    // If this is false, we've converged.
+    bool marked = false;
+    // Did we ever mark anything new?
+    bool anyMarked = false;
+    do {
+      marked = mark(node->blocks().at(0));
+      anyMarked |= marked;
+    } while (marked);
+    return anyMarked;
+  }
+
+  // Returns true iff this marked something we haven't marked before.
+  bool mark(Block* block) {
+    bool anyMarked = false;
     // Mark all nodes with side effects.
     for (auto node : block->nodes()) {
-      if (hasSideEffects(node)) {
-        markAndEnqueue(node);
+      if (sideEffectPolicy_ ==
+              DCESideEffectPolicy::DONT_DELETE_NODES_WITH_SIDE_EFFECTS &&
+          hasSideEffects(node)) {
+        anyMarked |= mark(node);
       }
     }
 
-    while (!workQueue_.empty()) {
-      auto node = workQueue_.front();
-      workQueue_.pop_front();
+    // Initialize by marking the return node
+    anyMarked |= markReturnNode(block->return_node());
 
-      for (auto subBlock : node->blocks()) {
-        mark(subBlock);
-      }
-
-      // Mark all nodes in this node's blockchain (since owning nodes are
-      // considered live if they contain a live node)
-      if (node->owningBlock() != block) {
-        auto curNode = node;
-        while (curNode) {
-          if (!curNode->owningBlock()) {
-            break;
-          }
-
-          markAndEnqueue(curNode);
-          curNode = curNode->owningBlock()->owningNode();
+    for (auto it = block->nodes().rbegin(); it != block->nodes().rend(); ++it) {
+      auto node = *it;
+      if (node->kind() == prim::Loop) {
+        // Special casing for loops, see comment in markLoop.
+        anyMarked |= markLoop(node);
+      } else {
+        // Other nodes with sub-blocks get marked normally.
+        for (auto subBlock : node->blocks()) {
+          anyMarked |= mark(subBlock);
         }
       }
+      anyMarked |= markIfLive(node);
+    }
+    return anyMarked;
+  }
 
-      // Find preceding writers for node, add to work list
-      if (aliasDb_) {
-        for (auto writer : aliasDb_->getWritersForNode(node)) {
-          if (writer->isBefore(node)) {
-            markAndEnqueue(writer);
-          }
-        }
-      }
-
-      // Find producers for all inputs, add to work list
-      for (auto input : node->inputs()) {
-        markAndEnqueue(input->node());
+  // If we output or write to a live memory location, mark this node
+  // Returns true iff this marked something we haven't marked before.
+  bool markIfLive(Node* node) {
+    for (const auto output : node->outputs()) {
+      if (liveValues_.count(output)) {
+        return mark(node);
       }
     }
+
+    if (aliasDb_) {
+      if (aliasDb_->writesToAlias(node, liveValues_)) {
+        return mark(node);
+      }
+    }
+    return false;
+  }
+
+  // Mark this node as live and add this node's inputs and aliases to the live
+  // value sets.
+  // Returns true iff this marked something we haven't marked before.
+  bool mark(Node* node) {
+    if (marked_.count(node)) {
+      return false;
+    }
+
+    marked_.insert(node);
+
+    // Mark all nodes in this node's blockchain (since owning nodes are
+    // considered live if they contain a live node)
+    auto curNode = node;
+    while (curNode) {
+      if (!curNode->owningBlock()) {
+        break;
+      }
+
+      mark(curNode);
+      curNode = curNode->owningBlock()->owningNode();
+    }
+
+    for (const auto input : node->inputs()) {
+      if (liveValues_.count(input)) {
+        continue;
+      }
+      liveValues_.insert(input);
+    }
+    return true;
   }
 
   // Delete all unmarked nodes.
@@ -107,46 +254,27 @@ class DeadCodeEliminator {
       auto node = *it;
       // note these occur before the recursion because we want to uncover
       // dead code in the blocks used to calculate the output
-      if (!collect_only_) {
-        removeDeadIfOutputs(node);
-        removeDeadLoopOutputs(node);
-      }
+      removeDeadBlockOutputs(node);
+      removeDeadLoopOutputs(node);
       if (recurse) {
         for (Block* block : node->blocks()) {
           sweep(block, true);
         }
       }
-      // TODO(suo): We shouldn't really have to check whether a node has uses,
-      // since the mark algorithm should do that. But currently, the marking
-      // doesn't reach loop counters in certain cases (see TestScript.test_pass)
-      if (!marked_.count(node) && !hasUsesOutsideDeadNodes(node)) {
-        if (collect_only_) {
-          dead_nodes_.insert(node);
-        } else {
-          it.destroyCurrent();
-        }
+      // NB: Checking hasUses() is required. AD graphs are not perfectly
+      // valid, as a node in grad_desc.f might be used in reverse_block.
+      // Reverse_block is inlined in grad_desc.f before it's separated
+      // to grad_desc.df.
+      if (!(marked_.count(node) || node->hasUses())) {
+        GRAPH_UPDATE(
+            "Node ",
+            it->kind().toQualString(),
+            " w/ output ",
+            (node->outputs().size() > 0 ? node->outputs().at(0)->debugName()
+                                        : "n/a"),
+            " will be removed");
+        it.destroyCurrent();
       }
-    }
-  }
-
-  bool hasUsesOutsideDeadNodes(Node * n) {
-    if (!collect_only_) {
-      return n->hasUses();
-    }
-    for (Value * output : n->outputs()) {
-      for (const Use & u : output->uses()) {
-        if (dead_nodes_.count(u.user) == 0) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  void markAndEnqueue(Node* n) {
-    if (!marked_.count(n)) {
-      marked_.insert(n);
-      workQueue_.push_back(n);
     }
   }
 
@@ -154,7 +282,7 @@ class DeadCodeEliminator {
     if (!aliasDb_) {
       // If we don't have alias information, all mutable ops have unknown
       // effects and can't be considered for elimination.
-      if (!node->kind().is_aten()) {
+      if (!node->kind().is_aten() && !node->kind().is_prim()) {
         return false;
       }
       // onnx export calls EliminateDeadCode but sometimes passes invalid
@@ -163,16 +291,7 @@ class DeadCodeEliminator {
       auto schema = node->maybeSchema();
       return schema && schema->is_mutable();
     } else {
-      // Otherwise, there are two kinds of nodes with untracked effects:
-      // 1. Nodes that write to a value that may alias the graph inputs (since
-      //    the inputs can be used outside the graph).
-      // 2. Anything that could clobber a wildcard value.
-      bool touchesWildcard = false;
-      if (lastWildcard_) {
-        touchesWildcard = aliasDb_->hasWrites(node) &&
-            (node->isBefore(*lastWildcard_) || node == *lastWildcard_);
-      }
-      return aliasDb_->writesToInputAlias(node) || touchesWildcard;
+      return aliasDb_->writesToWildcard(node);
     }
   }
 
@@ -180,10 +299,7 @@ class DeadCodeEliminator {
     auto it = memo_.find(node);
     if (it != memo_.end())
       return it->second;
-    bool has_side_effects = node->kind() == prim::Print ||
-        node->kind() == aten::warn ||
-        node->kind() == prim::RaiseException ||
-        node->kind() == prim::PythonOp ||
+    bool has_side_effects = node->hasSideEffects() ||
         std::any_of(node->blocks().begin(),
                     node->blocks().end(),
                     [&](Block* b) {
@@ -198,15 +314,28 @@ class DeadCodeEliminator {
     return has_side_effects;
   }
 
-  void removeDeadIfOutputs(Node* node) {
-    if (node->kind() != prim::If)
+  void removeDeadBlockOutputs(Node* node) {
+    if (node->kind() != prim::If && node->kind() != prim::GradOf) {
       return;
+    }
 
     for (size_t i_1 = node->outputs().size(); i_1 > 0; --i_1) {
       size_t i = i_1 - 1;
       if (!node->outputs().at(i)->hasUses()) {
+        GRAPH_UPDATE(
+            "Dead ",
+            i,
+            "-th output ",
+            node->outputs().at(i)->debugName(),
+            " of node ",
+            node->kind().toQualString(),
+            " will be removed");
         node->eraseOutput(i);
         for (Block* b : node->blocks()) {
+          GRAPH_UPDATE(
+              "\tCorresponding block output ",
+              b->outputs().at(i)->debugName(),
+              " will be removed");
           b->eraseOutput(i);
         }
       }
@@ -225,6 +354,7 @@ class DeadCodeEliminator {
       size_t i = i_1 - 1;
       if (!node->outputs().at(i)->hasUses() &&
           !loop_body->inputs().at(loop_body_offset + i)->hasUses()) {
+        logDeadLoopOutputs(node, i, loop_input_offset, loop_body_offset);
         node->eraseOutput(i);
         node->removeInput(loop_input_offset + i);
         loop_body->eraseInput(loop_body_offset + i);
@@ -233,28 +363,63 @@ class DeadCodeEliminator {
     }
   }
 
-  c10::optional<AliasDb> aliasDb_;
+  void logDeadLoopOutputs(
+      Node* node,
+      size_t i,
+      size_t loop_input_offset,
+      size_t loop_body_offset) {
+    auto loop_body = node->blocks().at(0);
+    GRAPH_UPDATE(
+        "Dead ",
+        loop_input_offset + i,
+        "-th input ",
+        node->inputs().at(i)->debugName(),
+        " will be removed");
+    GRAPH_UPDATE(
+        "Dead ",
+        i,
+        "-th output ",
+        node->outputs().at(i)->debugName(),
+        " will be removed");
+    GRAPH_UPDATE(
+        "\tDead block input ",
+        loop_body->inputs().at(loop_body_offset + i)->debugName(),
+        "at offset ",
+        loop_body_offset + i,
+        " will be removed");
+    GRAPH_UPDATE(
+        "\tDead block output ",
+        loop_body->outputs().at(loop_body_offset + i)->debugName(),
+        "at offset ",
+        loop_body_offset + i,
+        " will be removed");
+  }
+
+  DCESideEffectPolicy sideEffectPolicy_;
+  std::unique_ptr<AliasDb> aliasDb_ = nullptr;
   std::unordered_map<Node*, bool> memo_;
   std::unordered_set<Node*> marked_;
-  std::list<Node*> workQueue_;
-  c10::optional<const Node*> lastWildcard_;
-
-  bool collect_only_ = false;
-  std::unordered_set<Node*> dead_nodes_; // Will be filled iff collect_only_ is true
+  std::unordered_set<const Value*> liveValues_;
+  std::function<void(const std::unordered_set<const Value*>&)> deleteCallback_ =
+      [](const std::unordered_set<const Value*>&) {};
 };
 
-void EliminateDeadCode(const std::shared_ptr<Graph>& graph) {
-  DeadCodeEliminator(graph).run(graph->block(), /*recurse=*/true);
+void EliminateDeadCode(const std::shared_ptr<Graph>& graph, DCESideEffectPolicy sideEffectPolicy) {
+  DeadCodeEliminator(graph, sideEffectPolicy).run(graph->block(), /*recurse=*/true);
+  GRAPH_DUMP("After EliminateDeadCode: ", graph);
 }
 
-void EliminateDeadCode(Block* block, bool recurse) {
-  DeadCodeEliminator().run(block, recurse);
+void EliminateDeadCode(Block* block, bool recurse, DCESideEffectPolicy sideEffectPolicy) {
+  DeadCodeEliminator(sideEffectPolicy).run(block, recurse);
 }
 
-std::unordered_set<Node*> FindDeadNodes(Block* block, bool recurse) {
-  DeadCodeEliminator eliminator(/*collect_only=*/true);
-  eliminator.run(block, recurse);
-  return eliminator.get_dead_once();
+void EliminateDeadCode(
+    Block* block,
+    std::function<void(const std::unordered_set<const Value*>&)> cb,
+    DCESideEffectPolicy sideEffectPolicy) {
+  DeadCodeEliminator eliminator(sideEffectPolicy);
+  eliminator.setDeleteCallback(std::move(cb));
+  eliminator.run(block, /*recurse=*/true);
 }
 
 } // namespace jit

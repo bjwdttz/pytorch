@@ -8,11 +8,12 @@ from hypothesis import given
 
 
 dyndep.InitOpsLibrary("//caffe2/caffe2/quantization/server:dnnlowp_ops")
+workspace.GlobalInit(["caffe2", "--caffe2_omp_num_threads=11"])
 
 
 class DNNLowPResizeNearestOpTest(hu.HypothesisTestCase):
     @given(
-        N=st.integers(1, 3),
+        N=st.integers(0, 3),
         H=st.integers(10, 300),
         W=st.integers(10, 300),
         C=st.integers(1, 32),
