@@ -672,14 +672,17 @@ def parse_cpu_trace(thread_records):
             record_stack.append((next_id, record))
             next_id += 1
         elif record.kind() == 'pop':
+            if not record_stack:
+                print("empty record!")
+                continue
             function_id, start = record_stack.pop()
             fe = FunctionEvent(
                 id=function_id,
                 name=string_table[start.name()],
                 thread=start.thread_id(),
                 cpu_start=start_record.cpu_elapsed_us(start),
-                cpu_end=start_record.cpu_elapsed_us(record),
-                input_shapes=start.shapes())
+                cpu_end=start_record.cpu_elapsed_us(record))
+            '''
             if start.has_cuda():
                 cuda_start = adjusted_time(start)
                 cuda_end = adjusted_time(record)
@@ -687,6 +690,7 @@ def parse_cpu_trace(thread_records):
                                  start.device(),
                                  cuda_start,
                                  cuda_end)
+            '''
             functions.append(fe)
 
     functions.sort(key=lambda evt: evt.cpu_interval.start)

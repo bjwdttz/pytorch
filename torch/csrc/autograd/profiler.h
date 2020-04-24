@@ -147,11 +147,8 @@ struct TORCH_API Event final {
   uint16_t thread_id() const {
     return thread_id_;
   }
-  std::vector<std::vector<int64_t>> shapes() const {
-    return shapes_;
-  }
-  double cpu_elapsed_us(const Event & e) {
-    return (e.cpu_ns_ - cpu_ns_)/(1000.0);
+  int64_t cpu_elapsed_us(const Event & e) {
+    return e.cpu_ns_;
   }
   double cuda_elapsed_us(const Event & e);
   bool has_cuda() const {
